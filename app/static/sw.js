@@ -1,4 +1,4 @@
-const CACHE = "pixel-music-shell-v2";
+const CACHE = "pixel-music-shell-v3";
 const ASSETS = [
   "./",
   "./index.html",

@@ -76,8 +76,12 @@ class DownloadedAudio:
     extension: str
 
 
-def normalize_audio_url(url: str) -> str:
-    """Validate a direct audio URL and return a canonical form (no fragment)."""
+def prepare_public_url(url: str) -> str:
+    """Validate an http(s) URL and return a canonical form (no fragment).
+
+    The host must not be a streaming catalog, a local name, or a private
+    address literal. This does not require the path to name an audio file.
+    """
     raw = str(url or "").strip()
     if not raw or len(raw) > MAX_URL_LENGTH:
         raise LinkError("Paste a direct audio file link (MP3, M4A, AAC, OGG, Opus, WAV, or FLAC).")
@@ -101,13 +105,27 @@ def normalize_audio_url(url: str) -> str:
     _public_literal(host)
     if parts.port is not None and not 1 <= parts.port <= 65535:
         raise LinkError("That link isn't a direct audio file.")
-    extension = _extension(parts.path)
+    ascii_host = _ascii_host(host)
+    return urlunsplit((scheme, _netloc(ascii_host, parts.port), parts.path or "/", parts.query, ""))
+
+
+def normalize_audio_url(url: str) -> str:
+    """Validate a direct audio URL and return a canonical form (no fragment)."""
+    canonical = prepare_public_url(url)
+    extension = _extension(urlsplit(canonical).path)
     if extension not in ALLOWED_TYPES:
         raise LinkError(
             "That link isn't a direct audio file. Use an MP3, M4A, AAC, OGG, Opus, WAV, or FLAC URL."
         )
-    ascii_host = _ascii_host(host)
-    return urlunsplit((scheme, _netloc(ascii_host, parts.port), parts.path or "/", parts.query, ""))
+    return canonical
+
+
+def guard_remote_url(url: str, resolver) -> str:
+    """Return a canonical URL only when every resolved address is public."""
+    canonical = prepare_public_url(url)
+    host = urlsplit(canonical).hostname or ""
+    resolve_public(host, resolver)
+    return canonical
 
 
 def default_resolver(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
@@ -174,10 +192,20 @@ async def download_audio(
     resolver,
     transport: httpx.BaseTransport | None,
     max_bytes: int,
+    extension: str | None = None,
+    filename: str | None = None,
 ) -> DownloadedAudio:
+    """Download one public file.
+
+    Without `extension`, the URL path must name an allowed audio type. With
+    `extension`, the caller already knows the type (a playerprops media URL
+    often has none) and the bytes still have to match that type.
+    """
     if max_bytes < 1:
         raise LinkError("The size limit is too small.", status=413)
-    current = normalize_audio_url(url)
+    if extension is not None and extension not in ALLOWED_TYPES:
+        raise LinkError("That file doesn't match its audio type. Nothing was saved.")
+    current = _accept_download_url(url, extension)
     timeout = httpx.Timeout(10.0, read=30.0)
     async with httpx.AsyncClient(
         transport=transport,
@@ -189,7 +217,7 @@ async def download_audio(
             parts = urlsplit(current)
             host = parts.hostname or ""
             addresses = resolve_public(host, resolver)
-            extension = _extension(parts.path)
+            used_extension = extension or _extension(parts.path)
             pinned = _pinned_url(parts, addresses[0])
             async with client.stream(
                 "GET",
@@ -206,11 +234,14 @@ async def download_audio(
                     location = response.headers.get("location")
                     if not location:
                         raise LinkError("The server redirected without a new link. Nothing was saved.")
-                    current = normalize_audio_url(urljoin(current, location.strip()))
+                    current = _accept_download_url(urljoin(current, location.strip()), extension)
                     continue
                 if response.status_code != 200:
                     raise LinkError(f"The server returned HTTP {response.status_code}. Nothing was saved.")
-                mime = _matching_mime(response.headers.get("content-type", ""), extension)
+                if extension is None:
+                    mime = _matching_mime(response.headers.get("content-type", ""), used_extension)
+                else:
+                    mime = _mime_for_declared(response.headers.get("content-type", ""), used_extension)
                 length = response.headers.get("content-length")
                 if length and length.isdigit() and int(length) > max_bytes:
                     raise LinkError(_size_message(max_bytes), status=413)
@@ -232,12 +263,18 @@ async def download_audio(
                     raise LinkError("That file was empty. Nothing was saved.")
                 with dest.open("rb") as handle:
                     header = handle.read(64)
-                if not signature_matches(header, extension):
+                if not signature_matches(header, used_extension):
                     dest.unlink(missing_ok=True)
                     raise LinkError("That file doesn't match its audio type. Nothing was saved.")
-                filename = _filename_from_path(parts.path, extension)
-                return DownloadedAudio(mime_type=mime, filename=filename, extension=extension)
+                chosen = filename or _filename_from_path(parts.path, used_extension)
+                return DownloadedAudio(mime_type=mime, filename=chosen, extension=used_extension)
     raise LinkError("Too many redirects. Nothing was saved.")
+
+
+def _accept_download_url(url: str, extension: str | None) -> str:
+    if extension is None:
+        return normalize_audio_url(url)
+    return prepare_public_url(url)
 
 
 def _matching_mime(header: str, extension: str) -> str:
@@ -245,6 +282,28 @@ def _matching_mime(header: str, extension: str) -> str:
     allowed = ALLOWED_TYPES.get(extension, set())
     if mime in allowed:
         return mime
+    raise LinkError("The server didn't return audio. Nothing was saved.")
+
+
+_DECLARED_MIME = {
+    "mp3": "audio/mpeg",
+    "m4a": "audio/mp4",
+    "aac": "audio/aac",
+    "ogg": "audio/ogg",
+    "opus": "audio/ogg",
+    "wav": "audio/wav",
+    "flac": "audio/flac",
+}
+
+
+def _mime_for_declared(header: str, extension: str) -> str:
+    """Accept a matching audio type, or a generic type when the bytes are checked."""
+    mime = header.split(";", 1)[0].strip().lower()
+    allowed = ALLOWED_TYPES.get(extension, set())
+    if mime in allowed:
+        return mime
+    if mime in {"", "application/octet-stream", "binary/octet-stream", "application/binary"}:
+        return _DECLARED_MIME[extension]
     raise LinkError("The server didn't return audio. Nothing was saved.")
 
 

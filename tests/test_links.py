@@ -190,16 +190,20 @@ def test_missing_url_field(tmp_path):
     assert response.status_code == 422
 
 
-def test_no_streaming_rippers_in_requirements():
+def test_runtime_deps_include_yt_dlp_and_no_other_rippers():
     text = Path("requirements.txt").read_text(encoding="utf-8").lower()
-    for banned in ("yt-dlp", "youtube-dl", "pytube", "spotdl", "ytmusic"):
+    project = Path("pyproject.toml").read_text(encoding="utf-8").lower()
+    for banned in ("youtube-dl", "pytube", "spotdl", "ytmusic"):
         assert banned not in text
+        assert banned not in project
+    assert "yt-dlp" in text
+    assert "yt-dlp" in project
 
 
 def test_vercel_python_runtime_dependencies_are_declared():
     requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
     project = Path("pyproject.toml").read_text(encoding="utf-8").lower()
-    for package in ("fastapi", "httpx", "uvicorn", "mutagen"):
+    for package in ("fastapi", "httpx", "uvicorn", "mutagen", "yt-dlp"):
         assert package in requirements
         assert package in project
     assert "pytest" not in requirements

@@ -533,7 +533,7 @@ function renderAdd() {
     el("h2", { text: "Add a link" }),
     el("p", {
       class: "help",
-      text: "Paste a direct MP3, M4A, AAC, OGG, Opus, WAV, or FLAC file you have rights to. It is saved on this phone. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB. YouTube, Spotify, and Apple Music links are refused.",
+      text: "Paste a direct MP3, M4A, AAC, OGG, Opus, WAV, or FLAC file you have rights to, or a playerprops.com link. It is saved on this phone. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB. YouTube, Spotify, and Apple Music links are refused.",
     }),
     el("form", { class: "form", onsubmit: (event) => { void addLink(event); } }, [
       el("label", { class: "field", for: "audio-url" }, [
