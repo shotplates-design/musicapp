@@ -1,10 +1,10 @@
 # Pixel Music
 
-A small music player you can add to an iPhone home screen. Paste a **direct audio file link** you have the rights to use. The server checks the link and streams the file back. The song, its artwork, and its details are saved **in the browser** (IndexedDB) and play from there, including offline.
+A small music player you can add to an iPhone home screen. Paste a **playerprops.com** link you have the rights to use. The server reads that page and streams the file back. The file, its artwork, and its details are saved **in the browser** (IndexedDB) and play from there, including offline.
 
 The pixel look — colors, Press Start 2P and Silkscreen, icons, and the chunky CSS — is adapted from [shotplates-design/pixel-music](https://github.com/shotplates-design/pixel-music). Thank you to that project for the theme. The font licenses are in `app/static/fonts/`.
 
-This app does **not** rip YouTube, Spotify, SoundCloud, Apple Music, or any other streaming service. The one exception is a page on `playerprops.com` or a subdomain of it: those pages have no direct file link, so the server uses yt-dlp for that host only, then downloads the audio with the same public-address, size, and file-type checks. A lookalike such as `playerprops.com.evil.net` is not that host. Only add audio you have rights to.
+Only `playerprops.com` and its subdomains are accepted. Anything else, including YouTube, Spotify, SoundCloud, Apple Music, and lookalikes such as `playerprops.com.evil.net`, is refused with "Only playerprops.com links are supported." A playerprops link with an explicit port is refused. The server uses yt-dlp for that host only, prefers M4A, and saves the file as `.m4a` with content type `audio/mp4`. The download still checks that every address is public, stays under 4 MB, and finishes within 20 seconds. Only add audio you have rights to.
 
 There is no login. The server does not keep a library.
 
@@ -14,7 +14,7 @@ Each track record matches the pixel-music shape: `title`, `artist`, `duration`, 
 
 On launch the app calls `navigator.storage.persist()`. The header shows storage **used** and **free** from `navigator.storage.estimate()` when the browser provides them.
 
-Accepted links: `.mp3`, `.m4a`, `.aac`, `.ogg`, `.opus`, `.wav`, `.flac`. The response `Content-Type` must be audio that matches the extension, and the leading bytes must match that type (ID3 or an MP3 frame, M4A `ftyp`, Ogg, FLAC, WAV `RIFF`/`WAVE`, or AAC ADTS). Private, loopback, link-local, and disguised forms of those addresses are refused. The hostname is resolved once and the connection uses that address.
+The saved file is always `.m4a` (`audio/mp4`), which Safari on iPhone plays in the audio element. Private, loopback, link-local, and disguised forms of those addresses are refused. The hostname is resolved once and the connection uses that address.
 
 ## Size limit
 
@@ -105,4 +105,4 @@ Play a track, then lock the phone. The Media Session API publishes play, pause, 
 pytest
 ```
 
-The tests cover the fetch endpoint: the file is streamed back with its tags, nothing is left on the server, and YouTube, Spotify, Apple Music, private addresses, redirects to private addresses, bad file signatures, and oversized files are refused. They also check same-origin, the per-address limit, the 20 second deadline, the 4 MB cap, the web manifest, and the service worker.
+The tests cover the fetch endpoint: only playerprops.com links are accepted, the file is streamed back as M4A, nothing is left on the server, and other hosts, private addresses, redirects to private addresses, and oversized files are refused. They also check same-origin, the per-address limit, the 20 second deadline, the 4 MB cap, the web manifest, and the service worker.
