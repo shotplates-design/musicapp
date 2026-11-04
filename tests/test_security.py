@@ -54,10 +54,11 @@ def test_pins_the_validated_address_when_dns_changes(tmp_path):
         return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
 
     client, _application = client_for(tmp_path, handler, resolver=resolver)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"})
-    assert response.status_code == 201, response.text
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert response.status_code == 200, response.text
     assert seen == [("93.184.216.34", "cdn.example.com", "cdn.example.com")]
-    assert response.json()["track"]["byteSize"] == len(wav)
+    art_len = int(response.headers["x-pixel-artwork-length"])
+    assert response.content[art_len:] == wav
     assert next(answers) == [ipaddress.ip_address("127.0.0.1")]
 
 
@@ -72,11 +73,11 @@ def test_rejects_a_lookup_that_includes_a_private_address(tmp_path):
         return [PUBLIC, ipaddress.ip_address("10.0.0.1")]
 
     client, application = client_for(tmp_path, handler, resolver=resolver)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.mp3"})
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.mp3"})
     assert response.status_code == 400
     assert "isn't allowed" in response.json()["detail"]
     assert called["n"] == 0
-    assert application.state.library.list_tracks() == []
+    assert list(application.state.scratch.iterdir()) == []
 
 
 def test_connects_to_a_public_ipv6_answer(tmp_path):
@@ -90,8 +91,8 @@ def test_connects_to_a_public_ipv6_answer(tmp_path):
         return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
 
     client, _application = client_for(tmp_path, handler, resolver=lambda host: [PUBLIC_V6])
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"})
-    assert response.status_code == 201, response.text
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert response.status_code == 200, response.text
     assert seen == {
         "host": "2001:4860:4860::8888",
         "header": "cdn.example.com",
@@ -148,11 +149,10 @@ def test_rejects_a_body_whose_bytes_do_not_match_the_content_type(tmp_path):
         return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=b"<html>not audio</html>")
 
     client, application = client_for(tmp_path, handler)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"})
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
     assert response.status_code == 400
     assert "doesn't match" in response.json()["detail"]
-    assert application.state.library.list_tracks() == []
-    assert list(application.state.library.media.iterdir()) == []
+    assert list(application.state.scratch.iterdir()) == []
 
 
 def test_rejects_when_the_body_is_longer_than_a_lying_content_length(tmp_path):
@@ -166,10 +166,10 @@ def test_rejects_when_the_body_is_longer_than_a_lying_content_length(tmp_path):
         )
 
     client, application = client_for(tmp_path, handler, max_bytes=80)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"})
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
     assert response.status_code == 413
     assert "Nothing was saved" in response.json()["detail"]
-    assert application.state.library.list_tracks() == []
+    assert list(application.state.scratch.iterdir()) == []
 
 
 def test_counts_bytes_when_content_length_is_omitted(tmp_path):
@@ -181,9 +181,9 @@ def test_counts_bytes_when_content_length_is_omitted(tmp_path):
         return response
 
     client, application = client_for(tmp_path, over, max_bytes=80)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/big.wav"})
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/big.wav"})
     assert response.status_code == 413
-    assert application.state.library.list_tracks() == []
+    assert list(application.state.scratch.iterdir()) == []
 
     def under(request: httpx.Request) -> httpx.Response:
         response = httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
@@ -191,9 +191,10 @@ def test_counts_bytes_when_content_length_is_omitted(tmp_path):
         return response
 
     client, application = client_for(tmp_path / "ok", under, max_bytes=len(wav) + 10)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"})
-    assert response.status_code == 201, response.text
-    assert response.json()["track"]["byteSize"] == len(wav)
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert response.status_code == 200, response.text
+    art_len = int(response.headers["x-pixel-artwork-length"])
+    assert response.content[art_len:] == wav
 
 
 def test_stored_size_is_the_body_not_a_short_content_length(tmp_path):
@@ -207,47 +208,27 @@ def test_stored_size_is_the_body_not_a_short_content_length(tmp_path):
         )
 
     client, _application = client_for(tmp_path, handler, max_bytes=len(wav) + 10)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"})
-    assert response.status_code == 201, response.text
-    assert response.json()["track"]["byteSize"] == len(wav)
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert response.status_code == 200, response.text
+    art_len = int(response.headers["x-pixel-artwork-length"])
+    assert response.content[art_len:] == wav
 
 
-def test_exposed_server_requires_a_token_and_localhost_does_not(tmp_path):
-    with pytest.raises(RuntimeError, match="PIXEL_TOKEN"):
-        create_app(tmp_path / "open", bind_host="0.0.0.0")
-
+def test_non_loopback_starts_without_a_token_and_warns(tmp_path, capsys):
     wav = make_wav()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
 
-    client, _application = client_for(tmp_path, handler, bind_host="0.0.0.0", token="s3cret")
+    client, _application = client_for(tmp_path, handler, bind_host="0.0.0.0")
+    warning = capsys.readouterr().err
+    assert "no login" in warning.lower()
+    assert "add and delete" in warning.lower()
+    fetched = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert fetched.status_code == 200, fetched.text
     assert client.get("/").status_code == 200
-    assert client.get("/api/tracks").status_code == 401
-    assert client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"}).status_code == 401
 
-    headers = {"Authorization": "Bearer s3cret"}
-    created = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.wav"}, headers=headers)
-    assert created.status_code == 201, created.text
-    track_id = created.json()["track"]["id"]
-    assert client.get("/api/tracks", headers={"Authorization": "Bearer nope"}).status_code == 401
-    assert client.get("/api/tracks", headers=headers).status_code == 200
-    assert client.get(f"/api/tracks/{track_id}/audio").status_code == 401
-    assert client.get(f"/api/tracks/{track_id}/artwork").status_code == 401
-    audio = client.get(f"/api/tracks/{track_id}/audio", headers=headers)
-    assert audio.status_code == 200
-    client.cookies.set("pixel_token", "s3cret")
-    cookie = client.get(f"/api/tracks/{track_id}/audio")
-    assert cookie.status_code == 200
-    client.cookies.clear()
-    query = client.get(f"/api/tracks/{track_id}/audio?token=s3cret")
-    assert query.status_code == 200
-    assert client.delete(f"/api/tracks/{track_id}").status_code == 401
-    assert client.delete(f"/api/tracks/{track_id}", headers=headers).status_code == 200
-
+    capsys.readouterr()
     local, _local_app = client_for(tmp_path / "local", handler, bind_host="127.0.0.1")
-    assert local.get("/api/tracks").status_code == 200
-
-    tunneled, _tunneled_app = client_for(tmp_path / "tunnel", handler, bind_host="127.0.0.1", token="s3cret")
-    assert tunneled.get("/api/tracks").status_code == 401
-    assert tunneled.get("/api/tracks", headers=headers).status_code == 200
+    assert "WARNING" not in capsys.readouterr().err
+    assert local.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"}).status_code == 200

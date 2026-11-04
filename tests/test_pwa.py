@@ -35,6 +35,7 @@ def test_ios_shell(tmp_path):
     assert "/api/" in worker.text
     assert "apple-touch-icon.png" in worker.text
     assert "./index.html" in worker.text
+    assert "./js/db.js" in worker.text
 
     icon = client.get("/icons/apple-touch-icon.png")
     assert icon.status_code == 200
@@ -51,9 +52,15 @@ def test_ios_shell(tmp_path):
     script = client.get("/js/app.js")
     assert script.status_code == 200
     assert "mediaSession" in script.text
-    assert "Authorization" in script.text
-    assert "pixel_token" in script.text
+    assert "indexedDB" in script.text or "saveTrack" in script.text
+    assert "navigator.storage" in script.text
+    assert "persist" in script.text
+    assert "estimate" in script.text
+    assert "4 MB" in script.text
+    assert "4.5 MB" in script.text
     assert "setActionHandler" in script.text
+    assert "pixel_token" not in script.text
+    assert "PIXEL_TOKEN" not in script.text
     font = client.get("/fonts/PressStart2P-Regular.woff2")
     assert font.status_code == 200
     assert len(font.content) > 1000

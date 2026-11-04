@@ -1,8 +1,8 @@
-"""Run the player. The bind address and the token stay in the environment.
+"""Run the player.
 
-PIXEL_HOST defaults to 127.0.0.1. Set PIXEL_TOKEN before using any other host,
-or before publishing a tunnel to this port. The token is not read from a file
-in the repo.
+PIXEL_HOST defaults to 127.0.0.1. Any other host has no login: anyone who can
+reach the process can add and delete tracks and use the fetcher. create_app
+prints that warning when the bind address is not loopback.
 """
 
 from __future__ import annotations

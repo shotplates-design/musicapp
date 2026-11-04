@@ -1,39 +1,8 @@
+import { deleteTrackData, getMedia, listTracks, saveTrack } from "./db.js";
+
 const audio = document.querySelector("#audio");
 const view = document.querySelector("#view");
 const seek = document.querySelector("#seek");
-const TOKEN_KEY = "pixel-music-token";
-
-function loadToken() {
-  let stored = "";
-  try { stored = localStorage.getItem(TOKEN_KEY) || ""; } catch { stored = ""; }
-  const hash = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : "");
-  const fromHash = hash.get("token");
-  if (fromHash) {
-    stored = fromHash;
-    try { localStorage.setItem(TOKEN_KEY, stored); } catch { /* private mode */ }
-    hash.delete("token");
-    const rest = hash.toString();
-    history.replaceState(null, "", location.pathname + location.search + (rest ? `#${rest}` : ""));
-  }
-  if (stored) {
-    document.cookie = `pixel_token=${encodeURIComponent(stored)}; Path=/; SameSite=Strict`;
-  }
-  return stored;
-}
-
-const authToken = loadToken();
-
-function authHeaders(extra = {}) {
-  const headers = { ...extra };
-  if (authToken) headers.Authorization = `Bearer ${authToken}`;
-  return headers;
-}
-
-function withToken(url) {
-  const next = new URL(url, document.baseURI);
-  if (authToken) next.searchParams.set("token", authToken);
-  return next.href;
-}
 
 const state = {
   tab: "library",
@@ -90,6 +59,23 @@ function formatBytes(bytes) {
   return `${size.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d)0$/, "$1")} ${units[unit]}`;
 }
 
+const artUrls = new Map();
+
+function sortTracks(tracks) {
+  return tracks.slice().sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0) || String(a.title).localeCompare(String(b.title)));
+}
+
+function createId() {
+  if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function headerText(response, name) {
+  const raw = response.headers.get(name);
+  if (!raw) return "";
+  try { return decodeURIComponent(raw); } catch { return raw; }
+}
+
 function totalBytes(tracks) {
   return tracks.reduce((sum, track) => sum + (Number(track.byteSize) || 0) + (Number(track.artworkSize) || 0), 0);
 }
@@ -110,12 +96,9 @@ function toast(message) {
 
 function artNode(track, large = false) {
   const classes = large ? "art lg" : "art";
-  if (!track || !track.artworkSize) return el("span", { class: `${classes} art-empty` });
-  return el("img", {
-    class: classes,
-    src: withToken(`api/tracks/${track.id}/artwork`),
-    alt: "",
-  });
+  const src = track ? artUrls.get(track.id) : "";
+  if (!src) return el("span", { class: `${classes} art-empty` });
+  return el("img", { class: classes, src, alt: "" });
 }
 
 function nextIndex(index, length) {
@@ -133,16 +116,32 @@ function previousAction(index, length, currentTime, threshold = 3) {
   return { type: "restart", index };
 }
 
+async function refreshStorage() {
+  const node = document.querySelector("#usage");
+  let line = `${formatBytes(totalBytes(state.tracks))} in library`;
+  try {
+    if (navigator.storage?.estimate) {
+      const estimate = await navigator.storage.estimate();
+      const usage = Number(estimate.usage);
+      const quota = Number(estimate.quota);
+      if (Number.isFinite(usage) && Number.isFinite(quota) && quota > 0) {
+        const free = Math.max(0, quota - usage);
+        line = `${formatBytes(usage)} used\n${formatBytes(free)} free`;
+      }
+    }
+  } catch { /* estimate is optional */ }
+  node.textContent = line;
+}
+
 async function refresh() {
-  const response = await fetch("api/tracks", { cache: "no-store", headers: authHeaders() });
-  if (response.status === 401) {
-    toast("This server needs an access token. Open the address with #token=… once, then add it to the Home Screen.");
-    throw new Error("unauthorized");
+  const tracks = sortTracks(await listTracks());
+  for (const track of tracks) {
+    if (artUrls.has(track.id)) continue;
+    const media = await getMedia(track.id);
+    artUrls.set(track.id, media?.artwork ? URL.createObjectURL(media.artwork) : "");
   }
-  if (!response.ok) throw new Error("library");
-  const body = await response.json();
-  state.tracks = body.tracks || [];
-  document.querySelector("#usage").textContent = formatBytes(body.totalBytes ?? totalBytes(state.tracks));
+  state.tracks = tracks;
+  await refreshStorage();
   renderView();
   updatePlayerChrome();
 }
@@ -165,9 +164,9 @@ async function addLink(event) {
   toast("Downloading…");
   let response;
   try {
-    response = await fetch("api/tracks", {
+    response = await fetch("api/fetch", {
       method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
     });
   } catch {
@@ -176,16 +175,60 @@ async function addLink(event) {
     toast("Couldn't reach the server.");
     return;
   }
-  const body = await response.json().catch(() => ({}));
-  state.busy = false;
   if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    state.busy = false;
     renderView();
     toast(typeof body.detail === "string" ? body.detail : "Couldn't add that link.");
     return;
   }
+  const sourceUrl = headerText(response, "x-pixel-source-url");
+  if (sourceUrl && state.tracks.some((track) => track.sourceUrl === sourceUrl)) {
+    state.busy = false;
+    state.draftUrl = "";
+    state.tab = "library";
+    renderView();
+    toast("Already in your library.");
+    return;
+  }
+  const artLen = Number(response.headers.get("x-pixel-artwork-length") || 0);
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  const artBytes = artLen > 0 ? bytes.slice(0, artLen) : null;
+  const audioBytes = bytes.slice(Math.max(0, artLen));
+  const mime = response.headers.get("x-pixel-mime") || "application/octet-stream";
+  const artMime = response.headers.get("x-pixel-artwork-mime") || "image/jpeg";
+  const duration = Number(response.headers.get("x-pixel-duration"));
+  const meta = {
+    id: createId(),
+    title: headerText(response, "x-pixel-title") || "Untitled",
+    artist: headerText(response, "x-pixel-artist") || "Unknown artist",
+    duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+    mimeType: mime,
+    byteSize: audioBytes.byteLength,
+    artworkSize: artBytes ? artBytes.byteLength : 0,
+    artworkMime: artBytes ? artMime : null,
+    filename: headerText(response, "x-pixel-filename") || "audio",
+    addedAt: Date.now(),
+    source: "link",
+    sourceUrl,
+  };
+  try {
+    await saveTrack(
+      meta,
+      new Blob([audioBytes], { type: mime }),
+      artBytes ? new Blob([artBytes], { type: artMime }) : null,
+    );
+  } catch {
+    state.busy = false;
+    renderView();
+    toast("Couldn't save that song on this phone. Free some space and try again.");
+    return;
+  }
+  state.busy = false;
   state.draftUrl = "";
   state.tab = "library";
-  toast(body.created ? "Saved to your library." : "Already in your library.");
+  toast("Saved on this phone.");
   try {
     await refresh();
   } catch {
@@ -208,11 +251,14 @@ async function loadCurrent(autoplay) {
   const track = trackById(id);
   if (!track) return;
   state.currentId = id;
-  const nextSrc = withToken(`api/tracks/${id}/audio`);
-  if (audio.src !== nextSrc) {
-    audio.src = nextSrc;
-    audio.load();
+  const media = await getMedia(id);
+  if (!media?.audio) {
+    toast("That audio file is missing from this phone.");
+    return;
   }
+  if (audio._objectUrl) URL.revokeObjectURL(audio._objectUrl);
+  audio._objectUrl = URL.createObjectURL(media.audio);
+  audio.src = audio._objectUrl;
   publishSession(track);
   updatePlayerChrome();
   if (autoplay) {
@@ -275,7 +321,7 @@ function publishSession(track) {
   const artwork = [];
   if (track.artworkSize > 0) {
     artwork.push({
-      src: withToken(`api/tracks/${track.id}/artwork`),
+      src: artUrls.get(track.id) || new URL("icons/icon-512.png", document.baseURI).href,
       sizes: "512x512",
       type: track.artworkMime || "image/jpeg",
     });
@@ -445,7 +491,7 @@ function renderLibrary() {
   if (!state.tracks.length) {
     view.append(el("section", { class: "panel" }, [
       el("h2", { text: "Library" }),
-      el("p", { class: "help", text: "No tracks yet. Add a direct audio link you have rights to." }),
+        el("p", { class: "help", text: "No tracks yet. A saved song stays on this phone and can play offline." }),
       el("button", { class: "btn", type: "button", text: "Add a link", onclick: () => setTab("add") }),
     ]));
     return;
@@ -487,7 +533,7 @@ function renderAdd() {
     el("h2", { text: "Add a link" }),
     el("p", {
       class: "help",
-      text: "Paste a direct MP3, M4A, AAC, OGG, Opus, WAV, or FLAC file you have rights to. Title, artist, and artwork are read from the file. Up to 80 MB. YouTube, Spotify, and Apple Music links are refused.",
+      text: "Paste a direct MP3, M4A, AAC, OGG, Opus, WAV, or FLAC file you have rights to. It is saved on this phone. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB. YouTube, Spotify, and Apple Music links are refused.",
     }),
     el("form", { class: "form", onsubmit: (event) => { void addLink(event); } }, [
       el("label", { class: "field", for: "audio-url" }, [
@@ -548,7 +594,7 @@ function renderModal() {
 function confirmDelete(track) {
   state.modal = {
     title: "Delete track",
-    body: `Remove “${track.title}” and its audio from this library?`,
+    body: `Remove “${track.title}” and its audio from this phone?`,
     confirmLabel: "Delete",
     onConfirm: () => { void deleteTrack(track.id); },
   };
@@ -556,12 +602,11 @@ function confirmDelete(track) {
 }
 
 async function deleteTrack(id) {
+  const removed = artUrls.get(id);
+  if (removed) URL.revokeObjectURL(removed);
+  artUrls.delete(id);
   try {
-    const response = await fetch(`api/tracks/${id}`, { method: "DELETE", headers: authHeaders() });
-    if (!response.ok) {
-      toast("Couldn't delete that track.");
-      return;
-    }
+    await deleteTrackData(id);
   } catch {
     toast("Couldn't delete that track.");
     return;
@@ -652,10 +697,10 @@ function bindChrome() {
 }
 
 bindChrome();
+if (navigator.storage?.persist) navigator.storage.persist().catch(() => {});
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("./sw.js").catch(() => {});
 }
-refresh().catch((error) => {
-  if (error && error.message === "unauthorized") return;
+refresh().catch(() => {
   view.textContent = "Couldn't open the library.";
 });

@@ -21,7 +21,11 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 import httpx
 
 
-DEFAULT_MAX_BYTES = 80 * 1024 * 1024
+# Vercel Hobby still caps a function response at 4.5 MB. Streaming does not
+# raise that cap (https://vercel.com/docs/functions/limitations), so the file
+# we stream back stays at 4 MiB, under 4.5 MB whether that figure is decimal
+# or binary.
+DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 MAX_REDIRECTS = 5
 MAX_URL_LENGTH = 2000
 USER_AGENT = "PixelMusic/0.1 (personal library; direct audio files only)"
@@ -249,7 +253,13 @@ def _size_message(max_bytes: int) -> str:
         amount = f"{max_bytes // (1024 * 1024)} MB"
     else:
         amount = f"{max_bytes} bytes"
-    return f"That file is over the {amount} limit. Nothing was saved."
+    message = f"That file is over the {amount} limit. Nothing was saved."
+    if max_bytes == DEFAULT_MAX_BYTES:
+        message = (
+            f"That file is over the 4 MB limit. A streamed response still cannot "
+            f"exceed Vercel Hobby's 4.5 MB cap, so nothing was saved."
+        )
+    return message
 
 
 def _extension(path: str) -> str:
