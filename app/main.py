@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.download import DEFAULT_MAX_BYTES, LinkError, download_audio, normalize_audio_url
+from app.download import DEFAULT_MAX_BYTES, LinkError
 from app.guard import SlidingRateLimit, client_address, same_origin
 from app.library import title_from_filename
 from app.playerprops import canonical_playerprops_url, download_playerprops, is_playerprops_url
@@ -59,35 +59,23 @@ def create_app(
         """Validate a direct file link and stream it back. Nothing is stored."""
         if not same_origin(request):
             raise LinkError("Fetch only works from this app.", status=403)
-        playerprops = is_playerprops_url(body.url)
-        if playerprops:
-            normalized = canonical_playerprops_url(body.url)
-        else:
-            normalized = normalize_audio_url(body.url)
+        if not is_playerprops_url(body.url):
+            raise LinkError("Only playerprops.com links are supported.")
+        normalized = canonical_playerprops_url(body.url)
         if not app.state.limiter.allow(client_address(request)):
             raise LinkError("Too many downloads from this address. Wait a minute and try again.", status=429)
         tmp = scratch / f"{uuid.uuid4().hex}.bin"
         deadline = time.monotonic() + app.state.fetch_timeout
         try:
             async with asyncio.timeout_at(deadline):
-                resolver = app.state.resolver or _resolver()
-                if playerprops:
-                    downloaded = await download_playerprops(
-                        normalized,
-                        tmp,
-                        resolver=resolver,
-                        transport=app.state.transport,
-                        max_bytes=app.state.max_bytes,
-                        deadline=deadline,
-                    )
-                else:
-                    downloaded = await download_audio(
-                        normalized,
-                        tmp,
-                        resolver=resolver,
-                        transport=app.state.transport,
-                        max_bytes=app.state.max_bytes,
-                    )
+                downloaded = await download_playerprops(
+                    normalized,
+                    tmp,
+                    resolver=app.state.resolver or _resolver(),
+                    transport=app.state.transport,
+                    max_bytes=app.state.max_bytes,
+                    deadline=deadline,
+                )
                 try:
                     tags = read_tags(tmp)
                 except Exception:

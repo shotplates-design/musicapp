@@ -146,43 +146,36 @@ def test_playerprops_page_uses_yt_dlp_and_checks_the_media_file(tmp_path, monkey
     assert capture.calls == 1
     assert capture.download is False
     assert capture.url == "https://www.playerprops.com/watch/night"
-    assert capture.params["format"] == "bestaudio/best"
+    assert capture.params["format"] == "bestaudio[ext=m4a]/bestaudio/best"
     assert capture.params["noplaylist"] is True
     assert capture.params["fixup"] == "never"
     assert capture.params["postprocessors"] == []
     assert capture.params["allowed_extractors"] == ["generic"]
     assert seen == [("93.184.216.34", "cdn.example.com", "cdn.example.com")]
-    assert response.headers["x-pixel-filename"] == "Night%20Shift.wav"
+    assert response.headers["x-pixel-filename"] == "Night%20Shift.m4a"
+    assert response.headers["x-pixel-mime"] == "audio/mp4"
     art_len = int(response.headers["x-pixel-artwork-length"])
     assert response.content[art_len:] == wav
     assert list(application.state.scratch.iterdir()) == []
 
 
 def test_other_hosts_do_not_use_yt_dlp(tmp_path, monkeypatch):
-    wav = make_wav()
-    calls = {"n": 0}
-
     def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        if request.url.path.endswith("song.wav"):
-            return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
-        return httpx.Response(200, headers={"Content-Type": "audio/mpeg"}, content=bytes([0xFF, 0xFB, 0x90, 0x00]) + b"\x00" * 32)
+        raise AssertionError(request.url)
 
     client, _application, capture = client_for(tmp_path, handler, monkeypatch, {})
-    direct = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
-    assert direct.status_code == 200, direct.text
-    lookalike = client.post("/api/fetch", json={"url": "https://playerprops.com.evil.net/song.mp3"})
-    assert lookalike.status_code == 200, lookalike.text
     for url in (
+        "https://cdn.example.com/song.wav",
         "https://www.youtube.com/watch?v=abc",
         "https://soundcloud.com/artist/track",
         "https://open.spotify.com/track/abc",
+        "https://playerprops.com.evil.net/song.mp3",
         "https://playerprops.com.evil.net/watch",
     ):
         refused = client.post("/api/fetch", json={"url": url})
         assert refused.status_code == 400, url
+        assert refused.json()["detail"] == "Only playerprops.com links are supported."
     assert capture.calls == 0
-    assert calls["n"] == 2
 
 
 def test_playerprops_rejects_drm_private_media_and_streams(tmp_path, monkeypatch):
@@ -259,19 +252,24 @@ def test_playerprops_media_redirect_to_a_private_host_is_refused(tmp_path, monke
     assert list(application.state.scratch.iterdir()) == []
 
 
-def test_playerprops_rejects_a_file_that_is_not_audio_or_is_too_big(tmp_path, monkeypatch):
+def test_playerprops_saves_mp4_and_enforces_the_size_cap(tmp_path, monkeypatch):
+    payload = b"not-a-media-header"
+
     def html(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=b"<html>nope</html>")
+        return httpx.Response(200, headers={"Content-Type": "application/octet-stream"}, content=payload)
 
     client, application, _capture = client_for(
-        tmp_path / "bad",
+        tmp_path / "any",
         html,
         monkeypatch,
-        {"ext": "wav", "url": "https://cdn.example.com/song.wav", "protocol": "https"},
+        {"ext": "webm", "vcodec": "vp9", "url": "https://cdn.example.com/song.wav", "protocol": "https", "title": "Clip"},
     )
-    bad = client.post("/api/fetch", json={"url": "https://playerprops.com/track/4"})
-    assert bad.status_code == 400
-    assert "doesn't match" in bad.json()["detail"]
+    saved = client.post("/api/fetch", json={"url": "https://playerprops.com/track/4"})
+    assert saved.status_code == 200, saved.text
+    assert saved.headers["x-pixel-mime"] == "audio/mp4"
+    assert saved.headers["x-pixel-filename"] == "Clip.m4a"
+    art_len = int(saved.headers["x-pixel-artwork-length"])
+    assert saved.content[art_len:] == payload
     assert list(application.state.scratch.iterdir()) == []
 
     def big(request: httpx.Request) -> httpx.Response:
@@ -388,6 +386,38 @@ def test_extract_request_stops_when_the_deadline_has_passed():
     with pytest.raises(RequestError) as caught:
         handler.send(Request("https://playerprops.com/watch"))
     assert seen == []
+    assert caught.value.__cause__.status == 504
+
+
+def test_trickling_page_stops_at_the_deadline():
+    from yt_dlp.networking import Request
+    from yt_dlp.networking.exceptions import RequestError
+
+    from app.playerprops import make_pinned_handler
+
+    class SlowBody(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(40):
+                time.sleep(0.2)
+                yield b"0123456789"
+
+        def close(self):
+            return None
+
+    class SlowTransport(httpx.BaseTransport):
+        def handle_request(self, request):
+            return httpx.Response(200, stream=SlowBody())
+
+    started = time.monotonic()
+    handler = make_pinned_handler(
+        resolver=lambda host: [PUBLIC],
+        deadline=started + 0.5,
+        transport=SlowTransport(),
+    )
+    with pytest.raises(RequestError) as caught:
+        handler.send(Request("https://playerprops.com/watch"))
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.5
     assert caught.value.__cause__.status == 504
 
 

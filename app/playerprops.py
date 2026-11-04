@@ -2,13 +2,12 @@
 
 Only that host, and its subdomains, may use yt-dlp. The match is the parsed
 hostname, exactly `playerprops.com` or a name that ends in `.playerprops.com`.
-`playerprops.com.evil.net` does not match. YouTube, Spotify, and every other
-host stay on the direct-file path.
+`playerprops.com.evil.net` does not match. Every other host is refused.
 
-yt-dlp only resolves the page. The audio bytes are downloaded with the same
-public-address and magic-byte checks as a direct file. There is no ffmpeg and
-no post-processing. Anything yt-dlp writes is confined to a temporary directory
-and removed before this function returns.
+yt-dlp only resolves the page. The file it points at is downloaded with the
+public-address, size, and deadline checks. The saved file is always `.m4a`.
+There is no ffmpeg and no post-processing. Anything yt-dlp writes is confined
+to a temporary directory and removed before this function returns.
 """
 
 from __future__ import annotations
@@ -38,7 +37,7 @@ from app.download import (
 from app.library import safe_filename
 
 PLAYERPROPS_HOST = "playerprops.com"
-_EXT_ALIAS = {"mp4": "m4a"}
+M4A_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
 _STREAM_PROTOCOLS = ("m3u8", "dash", "ism", "f4m")
 
 
@@ -75,25 +74,22 @@ async def download_playerprops(url, dest, *, resolver, transport, max_bytes, dea
     """Resolve one playerprops page, then download its public audio file."""
     page = canonical_playerprops_url(url)
     guard_remote_url(page, resolver)
-    info = await asyncio.to_thread(_extract, page, resolver, deadline)
+    info = await asyncio.to_thread(_extract, page, resolver, deadline, transport, max_bytes)
     _reject_drm(info)
     _reject_playlist(info)
     _reject_stream(info)
     media = str(info.get("url") or "").strip()
     if not media:
-        raise LinkError("That page didn't include an audio file. Nothing was saved.")
-    extension = _supported_ext(str(info.get("ext") or ""))
-    guard_remote_url(media, resolver)
-    title = str(info.get("title") or "").strip()
-    filename = safe_filename(title, extension) if title else None
+        raise LinkError("That page didn't include a file. Nothing was saved.")
+    title = str(info.get("title") or "").strip() or "track"
     return await download_audio(
         media,
         dest,
         resolver=resolver,
         transport=transport,
         max_bytes=max_bytes,
-        extension=extension,
-        filename=filename,
+        mime_type="audio/mp4",
+        filename=safe_filename(title, "m4a"),
     )
 
 
@@ -107,7 +103,7 @@ def ydl_params(directory: Path) -> dict:
     """Options for one page. No playlist, no ffmpeg, no files left behind."""
     folder = str(directory)
     return {
-        "format": "bestaudio/best",
+        "format": M4A_FORMAT,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -127,11 +123,11 @@ def ydl_params(directory: Path) -> dict:
     }
 
 
-def _extract(url: str, resolver, deadline, transport=None) -> dict:
+def _extract(url: str, resolver, deadline, transport=None, max_bytes: int = DEFAULT_MAX_BYTES) -> dict:
     yt_dlp = _yt_dlp()
     with tempfile.TemporaryDirectory(prefix="pixel-ydl-") as tmp:
         params = ydl_params(Path(tmp))
-        ydl_cls = _checking_ydl(yt_dlp.YoutubeDL, resolver, deadline, transport)
+        ydl_cls = _checking_ydl(yt_dlp.YoutubeDL, resolver, deadline, transport, max_bytes)
         try:
             with ydl_cls(params) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -160,13 +156,14 @@ def _linked_error(exc: BaseException):
     return None
 
 
-def _checking_ydl(base, resolver, deadline, transport):
+def _checking_ydl(base, resolver, deadline, transport, max_bytes=DEFAULT_MAX_BYTES):
     class CheckingYDL(base):
         def __init__(self, params):
             super().__init__(params)
             self._pixel_resolver = resolver
             self._pixel_deadline = deadline
             self._pixel_transport = transport
+            self._pixel_max_bytes = max_bytes
 
         def urlopen(self, req):
             director = self._request_director
@@ -175,6 +172,7 @@ def _checking_ydl(base, resolver, deadline, transport):
                     resolver=self._pixel_resolver,
                     deadline=self._pixel_deadline,
                     transport=self._pixel_transport,
+                    max_bytes=self._pixel_max_bytes,
                     logger=director.logger,
                 ))
                 director.preferences.add(
@@ -211,7 +209,7 @@ class _SilentLog:
         return None
 
 
-def make_pinned_handler(*, resolver, deadline, transport=None, logger=None):
+def make_pinned_handler(*, resolver, deadline, transport=None, logger=None, max_bytes: int = DEFAULT_MAX_BYTES):
     """HTTP handler that connects to one checked public address.
 
     yt-dlp's Request exposes `.url`, not `.full_url`. Every hop is checked
@@ -226,11 +224,12 @@ def make_pinned_handler(*, resolver, deadline, transport=None, logger=None):
         _SUPPORTED_PROXY_SCHEMES = None
         _SUPPORTED_FEATURES = None
 
-        def __init__(self, *, resolver, deadline, transport, **kwargs):
+        def __init__(self, *, resolver, deadline, transport, max_bytes, **kwargs):
             super().__init__(**kwargs)
             self._resolver = resolver
             self._deadline = deadline
             self._transport = transport
+            self._max_bytes = max_bytes
 
         def _validate(self, request):
             return None
@@ -256,16 +255,20 @@ def make_pinned_handler(*, resolver, deadline, transport=None, logger=None):
                 trust_env=False,
             ) as client:
                 for _hop in range(MAX_REDIRECTS + 1):
-                    remaining = self._deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise LinkError("That download took too long. Nothing was saved.", status=504)
+                    self._check_deadline()
                     canonical = canonical_playerprops_url(current)
                     parts = urlsplit(canonical)
                     host = parts.hostname or ""
                     addresses = resolve_public(host, self._resolver)
                     pinned = _pinned_url(parts, addresses[0])
+                    # A per-read timeout is not the request deadline. Keep each
+                    # socket wait short, and check the wall clock on every chunk.
+                    self._check_deadline()
                     try:
-                        response = client.request(
+                        remaining = self._deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise LinkError("That download took too long. Nothing was saved.", status=504)
+                        with client.stream(
                             method,
                             pinned,
                             headers={
@@ -274,45 +277,58 @@ def make_pinned_handler(*, resolver, deadline, transport=None, logger=None):
                                 "Accept-Encoding": "identity",
                             },
                             extensions={"sni_hostname": host},
-                            timeout=httpx.Timeout(remaining),
-                        )
+                            timeout=httpx.Timeout(min(remaining, 1.0)),
+                        ) as response:
+                            if response.status_code in REDIRECTS:
+                                location = response.headers.get("location")
+                                if not location:
+                                    raise LinkError("The server redirected without a new link. Nothing was saved.")
+                                current = urljoin(canonical, location.strip())
+                                if response.status_code in {301, 302, 303}:
+                                    method = "GET"
+                                continue
+                            if response.status_code != 200:
+                                raise LinkError(f"The server returned HTTP {response.status_code}. Nothing was saved.")
+                            body = self._read_body(response)
+                            built = Response(
+                                fp=io.BytesIO(body),
+                                url=canonical,
+                                headers=dict(response.headers),
+                                status=response.status_code,
+                            )
                     except httpx.TimeoutException as exc:
                         raise LinkError("That download took too long. Nothing was saved.", status=504) from exc
-                    if response.status_code in REDIRECTS:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise LinkError("The server redirected without a new link. Nothing was saved.")
-                        current = urljoin(canonical, location.strip())
-                        if response.status_code in {301, 302, 303}:
-                            method = "GET"
-                        continue
-                    if response.status_code != 200:
-                        raise LinkError(f"The server returned HTTP {response.status_code}. Nothing was saved.")
-                    body = _read_capped(response)
-                    return Response(
-                        fp=io.BytesIO(body),
-                        url=canonical,
-                        headers=dict(response.headers),
-                        status=response.status_code,
-                    )
+                    return built
             raise LinkError("Too many redirects. Nothing was saved.")
+
+        def _check_deadline(self) -> None:
+            if time.monotonic() >= self._deadline:
+                raise LinkError("That download took too long. Nothing was saved.", status=504)
+
+        def _read_body(self, response: httpx.Response) -> bytes:
+            length = response.headers.get("content-length")
+            if length and length.isdigit() and int(length) > self._max_bytes:
+                raise LinkError(_size_message(self._max_bytes), status=413)
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.iter_bytes():
+                self._check_deadline()
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > self._max_bytes:
+                    raise LinkError(_size_message(self._max_bytes), status=413)
+                chunks.append(chunk)
+            return b"".join(chunks)
 
     return _PinnedRH(
         logger=logger or _SilentLog(),
         resolver=resolver,
         deadline=deadline,
         transport=transport,
+        max_bytes=max_bytes,
         timeout=10,
     )
-
-
-def _read_capped(response: httpx.Response) -> bytes:
-    length = response.headers.get("content-length")
-    if length and length.isdigit() and int(length) > DEFAULT_MAX_BYTES:
-        raise LinkError(_size_message(DEFAULT_MAX_BYTES), status=413)
-    if len(response.content) > DEFAULT_MAX_BYTES:
-        raise LinkError(_size_message(DEFAULT_MAX_BYTES), status=413)
-    return response.content
 
 
 def _reject_drm(info: dict) -> None:
@@ -337,14 +353,3 @@ def _reject_stream(info: dict) -> None:
         raise LinkError("That track is a stream this server can't save without ffmpeg. Nothing was saved.")
 
 
-def _supported_ext(ext: str) -> str:
-    cleaned = ext.lower().strip().lstrip(".")
-    cleaned = _EXT_ALIAS.get(cleaned, cleaned)
-    from app.download import ALLOWED_TYPES
-
-    if cleaned not in ALLOWED_TYPES:
-        raise LinkError(
-            "That page didn't include a supported audio file "
-            "(MP3, M4A, AAC, OGG, Opus, WAV, or FLAC). Nothing was saved."
-        )
-    return cleaned

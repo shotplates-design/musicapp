@@ -168,23 +168,6 @@ def resolve_public(host: str, resolver) -> list[ipaddress.IPv4Address | ipaddres
     return checked
 
 
-def signature_matches(header: bytes, extension: str) -> bool:
-    """True when the leading bytes are the file type the URL extension names."""
-    if extension == "mp3":
-        return header.startswith(b"ID3") or _mpeg_frame(header)
-    if extension == "m4a":
-        return len(header) >= 8 and header[4:8] == b"ftyp"
-    if extension in {"ogg", "opus"}:
-        return header.startswith(b"OggS")
-    if extension == "flac":
-        return header.startswith(b"fLaC")
-    if extension == "wav":
-        return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE"
-    if extension == "aac":
-        return _adts(header)
-    return False
-
-
 async def download_audio(
     url: str,
     dest: Path,
@@ -192,20 +175,13 @@ async def download_audio(
     resolver,
     transport: httpx.BaseTransport | None,
     max_bytes: int,
-    extension: str | None = None,
+    mime_type: str = "application/octet-stream",
     filename: str | None = None,
 ) -> DownloadedAudio:
-    """Download one public file.
-
-    Without `extension`, the URL path must name an allowed audio type. With
-    `extension`, the caller already knows the type (a playerprops media URL
-    often has none) and the bytes still have to match that type.
-    """
+    """Download one public file. The caller names the type; the bytes are not inspected."""
     if max_bytes < 1:
         raise LinkError("The size limit is too small.", status=413)
-    if extension is not None and extension not in ALLOWED_TYPES:
-        raise LinkError("That file doesn't match its audio type. Nothing was saved.")
-    current = _accept_download_url(url, extension)
+    current = prepare_public_url(url)
     timeout = httpx.Timeout(10.0, read=30.0)
     async with httpx.AsyncClient(
         transport=transport,
@@ -217,7 +193,6 @@ async def download_audio(
             parts = urlsplit(current)
             host = parts.hostname or ""
             addresses = resolve_public(host, resolver)
-            used_extension = extension or _extension(parts.path)
             pinned = _pinned_url(parts, addresses[0])
             async with client.stream(
                 "GET",
@@ -225,7 +200,7 @@ async def download_audio(
                 headers={
                     "Host": _host_header(host, parts.port, parts.scheme),
                     "User-Agent": USER_AGENT,
-                    "Accept": "audio/*",
+                    "Accept": "*/*",
                     "Accept-Encoding": "identity",
                 },
                 extensions={"sni_hostname": host},
@@ -234,14 +209,10 @@ async def download_audio(
                     location = response.headers.get("location")
                     if not location:
                         raise LinkError("The server redirected without a new link. Nothing was saved.")
-                    current = _accept_download_url(urljoin(current, location.strip()), extension)
+                    current = prepare_public_url(urljoin(current, location.strip()))
                     continue
                 if response.status_code != 200:
                     raise LinkError(f"The server returned HTTP {response.status_code}. Nothing was saved.")
-                if extension is None:
-                    mime = _matching_mime(response.headers.get("content-type", ""), used_extension)
-                else:
-                    mime = _mime_for_declared(response.headers.get("content-type", ""), used_extension)
                 length = response.headers.get("content-length")
                 if length and length.isdigit() and int(length) > max_bytes:
                     raise LinkError(_size_message(max_bytes), status=413)
@@ -261,50 +232,9 @@ async def download_audio(
                 if written <= 0:
                     dest.unlink(missing_ok=True)
                     raise LinkError("That file was empty. Nothing was saved.")
-                with dest.open("rb") as handle:
-                    header = handle.read(64)
-                if not signature_matches(header, used_extension):
-                    dest.unlink(missing_ok=True)
-                    raise LinkError("That file doesn't match its audio type. Nothing was saved.")
-                chosen = filename or _filename_from_path(parts.path, used_extension)
-                return DownloadedAudio(mime_type=mime, filename=chosen, extension=used_extension)
+                chosen = filename or _filename_from_path(parts.path, "m4a")
+                return DownloadedAudio(mime_type=mime_type or "audio/mp4", filename=chosen, extension="m4a")
     raise LinkError("Too many redirects. Nothing was saved.")
-
-
-def _accept_download_url(url: str, extension: str | None) -> str:
-    if extension is None:
-        return normalize_audio_url(url)
-    return prepare_public_url(url)
-
-
-def _matching_mime(header: str, extension: str) -> str:
-    mime = header.split(";", 1)[0].strip().lower()
-    allowed = ALLOWED_TYPES.get(extension, set())
-    if mime in allowed:
-        return mime
-    raise LinkError("The server didn't return audio. Nothing was saved.")
-
-
-_DECLARED_MIME = {
-    "mp3": "audio/mpeg",
-    "m4a": "audio/mp4",
-    "aac": "audio/aac",
-    "ogg": "audio/ogg",
-    "opus": "audio/ogg",
-    "wav": "audio/wav",
-    "flac": "audio/flac",
-}
-
-
-def _mime_for_declared(header: str, extension: str) -> str:
-    """Accept a matching audio type, or a generic type when the bytes are checked."""
-    mime = header.split(";", 1)[0].strip().lower()
-    allowed = ALLOWED_TYPES.get(extension, set())
-    if mime in allowed:
-        return mime
-    if mime in {"", "application/octet-stream", "binary/octet-stream", "application/binary"}:
-        return _DECLARED_MIME[extension]
-    raise LinkError("The server didn't return audio. Nothing was saved.")
 
 
 def _size_message(max_bytes: int) -> str:
@@ -424,21 +354,6 @@ def _inet_aton(parts: list[int]) -> int:
     if len(parts) == 3:
         return (parts[0] << 24) | (parts[1] << 16) | parts[2]
     return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
-
-
-def _mpeg_frame(header: bytes) -> bool:
-    if len(header) < 2 or header[0] != 0xFF or (header[1] & 0xE0) != 0xE0:
-        return False
-    version = (header[1] >> 3) & 0x03
-    layer = (header[1] >> 1) & 0x03
-    return version != 0x01 and layer != 0x00
-
-
-def _adts(header: bytes) -> bool:
-    if len(header) < 2 or header[0] != 0xFF:
-        return False
-    # 12-bit sync, layer bits must be 00. ID and protection bits may vary.
-    return (header[1] & 0xF6) == 0xF0
 
 
 def _ascii_host(host: str) -> str:

@@ -156,7 +156,7 @@ async function addLink(event) {
   if (state.busy) return;
   const url = state.draftUrl.trim();
   if (!url) {
-    toast("Paste a direct audio file link.");
+    toast("Paste a playerprops.com link.");
     return;
   }
   state.busy = true;
@@ -196,7 +196,7 @@ async function addLink(event) {
   const bytes = new Uint8Array(buffer);
   const artBytes = artLen > 0 ? bytes.slice(0, artLen) : null;
   const audioBytes = bytes.slice(Math.max(0, artLen));
-  const mime = response.headers.get("x-pixel-mime") || "application/octet-stream";
+  const mime = response.headers.get("x-pixel-mime") || "audio/mp4";
   const artMime = response.headers.get("x-pixel-artwork-mime") || "image/jpeg";
   const duration = Number(response.headers.get("x-pixel-duration"));
   const meta = {
@@ -257,7 +257,8 @@ async function loadCurrent(autoplay) {
     return;
   }
   if (audio._objectUrl) URL.revokeObjectURL(audio._objectUrl);
-  audio._objectUrl = URL.createObjectURL(media.audio);
+  const playable = media.audio.type === "audio/mp4" ? media.audio : new Blob([media.audio], { type: "audio/mp4" });
+  audio._objectUrl = URL.createObjectURL(playable);
   audio.src = audio._objectUrl;
   publishSession(track);
   updatePlayerChrome();
@@ -533,7 +534,7 @@ function renderAdd() {
     el("h2", { text: "Add a link" }),
     el("p", {
       class: "help",
-      text: "Paste a direct MP3, M4A, AAC, OGG, Opus, WAV, or FLAC file you have rights to, or a playerprops.com link. It is saved on this phone. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB. YouTube, Spotify, and Apple Music links are refused.",
+      text: "Only playerprops.com links are supported. The file is saved on this phone as M4A and plays here. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB.",
     }),
     el("form", { class: "form", onsubmit: (event) => { void addLink(event); } }, [
       el("label", { class: "field", for: "audio-url" }, [
@@ -542,7 +543,7 @@ function renderAdd() {
           id: "audio-url",
           type: "url",
           inputmode: "url",
-          placeholder: "https://example.com/song.mp3",
+          placeholder: "https://playerprops.com/…",
           autocomplete: "off",
           autocapitalize: "off",
           autocorrect: "off",
