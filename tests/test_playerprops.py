@@ -1,6 +1,9 @@
 import io
 import ipaddress
+import socket
+import time
 import wave
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -147,6 +150,7 @@ def test_playerprops_page_uses_yt_dlp_and_checks_the_media_file(tmp_path, monkey
     assert capture.params["noplaylist"] is True
     assert capture.params["fixup"] == "never"
     assert capture.params["postprocessors"] == []
+    assert capture.params["allowed_extractors"] == ["generic"]
     assert seen == [("93.184.216.34", "cdn.example.com", "cdn.example.com")]
     assert response.headers["x-pixel-filename"] == "Night%20Shift.wav"
     art_len = int(response.headers["x-pixel-artwork-length"])
@@ -295,3 +299,127 @@ def test_credentials_on_a_playerprops_link_are_refused(tmp_path, monkeypatch):
     assert response.status_code == 400
     assert "password" in response.json()["detail"]
     assert capture.calls == 0
+
+
+def test_playerprops_links_cannot_include_a_port(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(request.url)
+
+    client, _application, capture = client_for(tmp_path, handler, monkeypatch, {})
+    response = client.post("/api/fetch", json={"url": "https://playerprops.com:443/track"})
+    assert response.status_code == 400
+    assert "port" in response.json()["detail"]
+    assert capture.calls == 0
+
+
+def _pinned(handler, resolver=None, deadline=None):
+    from app.playerprops import make_pinned_handler
+
+    seen = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, request.headers.get("host"), request.extensions.get("sni_hostname")))
+        return handler(request)
+
+    return make_pinned_handler(
+        resolver=resolver or (lambda host: [PUBLIC]),
+        deadline=time.monotonic() + 5 if deadline is None else deadline,
+        transport=httpx.MockTransport(transport),
+    ), seen
+
+
+def test_real_request_url_is_checked_before_any_connection():
+    from yt_dlp.networking import Request
+    from yt_dlp.networking.exceptions import RequestError
+
+    req = Request("http://127.0.0.1/secret")
+    assert req.url.startswith("http://127.0.0.1")
+    assert not hasattr(req, "full_url")
+    handler, seen = _pinned(lambda request: httpx.Response(200, text="nope"))
+    with pytest.raises(RequestError) as caught:
+        handler.send(req)
+    assert seen == []
+    assert "isn't allowed" in str(caught.value.__cause__)
+
+
+def test_pinned_handler_keeps_the_first_address_and_rechecks_redirects():
+    from yt_dlp.networking import Request
+    from yt_dlp.networking.exceptions import RequestError
+
+    answers = [[PUBLIC], [ipaddress.ip_address("127.0.0.1")]]
+
+    def resolver(host):
+        assert host == "a.playerprops.com"
+        return answers.pop(0)
+
+    def page(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1/secret"})
+
+    handler, seen = _pinned(page, resolver=resolver)
+    with pytest.raises(RequestError) as caught:
+        handler.send(Request("https://a.playerprops.com/watch"))
+    assert seen == [("93.184.216.34", "a.playerprops.com", "a.playerprops.com")]
+    assert answers == [[ipaddress.ip_address("127.0.0.1")]]
+    assert "isn't allowed" in str(caught.value.__cause__)
+
+
+def test_pinned_handler_refuses_a_redirect_off_playerprops():
+    from yt_dlp.networking import Request
+    from yt_dlp.networking.exceptions import RequestError
+
+    def page(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "https://www.youtube.com/watch?v=abc"})
+
+    handler, seen = _pinned(page)
+    with pytest.raises(RequestError) as caught:
+        handler.send(Request("https://www.playerprops.com/embed"))
+    assert len(seen) == 1
+    assert "YouTube" in str(caught.value.__cause__)
+
+
+def test_extract_request_stops_when_the_deadline_has_passed():
+    from yt_dlp.networking import Request
+    from yt_dlp.networking.exceptions import RequestError
+
+    def page(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(request.url)
+
+    handler, seen = _pinned(page, deadline=time.monotonic() - 1)
+    with pytest.raises(RequestError) as caught:
+        handler.send(Request("https://playerprops.com/watch"))
+    assert seen == []
+    assert caught.value.__cause__.status == 504
+
+
+def test_urlopen_does_not_connect_to_a_loopback_probe(tmp_path):
+    import yt_dlp
+    from yt_dlp.networking import Request
+
+    from app.playerprops import _checking_ydl, ydl_params
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(0.3)
+    port = listener.getsockname()[1]
+    try:
+        cls = _checking_ydl(yt_dlp.YoutubeDL, lambda host: [PUBLIC], time.monotonic() + 2, None)
+        with cls(ydl_params(Path(tmp_path))) as ydl:
+            with pytest.raises(Exception) as caught:
+                ydl.urlopen(Request(f"http://127.0.0.1:{port}/secret"))
+        assert "isn't allowed" in str(caught.value)
+        with pytest.raises(socket.timeout):
+            listener.accept()
+    finally:
+        listener.close()
+
+
+def test_only_the_generic_extractor_is_enabled(tmp_path):
+    import yt_dlp
+
+    from app.playerprops import _checking_ydl, ydl_params
+
+    cls = _checking_ydl(yt_dlp.YoutubeDL, lambda host: [PUBLIC], time.monotonic() + 2, None)
+    with cls(ydl_params(tmp_path)) as ydl:
+        names = sorted(name.lower() for name in ydl._ies)
+    assert names == ["generic"]

@@ -198,6 +198,8 @@ def test_runtime_deps_include_yt_dlp_and_no_other_rippers():
         assert banned not in project
     assert "yt-dlp" in text
     assert "yt-dlp" in project
+    assert "<" in text[text.index("yt-dlp"):text.index("yt-dlp") + 40]
+    assert "<" in project[project.index("yt-dlp"):project.index("yt-dlp") + 40]
 
 
 def test_vercel_python_runtime_dependencies_are_declared():

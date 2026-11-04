@@ -4,7 +4,7 @@ A small music player you can add to an iPhone home screen. Paste a **direct audi
 
 The pixel look — colors, Press Start 2P and Silkscreen, icons, and the chunky CSS — is adapted from [shotplates-design/pixel-music](https://github.com/shotplates-design/pixel-music). Thank you to that project for the theme. The font licenses are in `app/static/fonts/`.
 
-This app does **not** rip YouTube, Spotify, SoundCloud, Apple Music, or any other streaming service. The one exception is a page on `playerprops.com` or a subdomain of it: those pages have no direct file link, so the server uses yt-dlp for that host only, then downloads the audio with the same public-address, size, and file-type checks. A lookalike such as `playerprops.com.evil.net` is not that host. Only add audio you have rights to.
+This app does **not** rip YouTube, Spotify, SoundCloud, Apple Music, or any other streaming service. The one exception is a page on `playerprops.com` or a subdomain of it: those pages have no direct file link, so the server uses yt-dlp for that host only, then downloads the audio with the same public-address, size, and file-type checks. A lookalike such as `playerprops.com.evil.net` is not that host, and a playerprops link with an explicit port is refused. Only add audio you have rights to.
 
 There is no login. The server does not keep a library.
 

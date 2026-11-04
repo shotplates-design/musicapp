@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -66,8 +67,9 @@ def create_app(
         if not app.state.limiter.allow(client_address(request)):
             raise LinkError("Too many downloads from this address. Wait a minute and try again.", status=429)
         tmp = scratch / f"{uuid.uuid4().hex}.bin"
+        deadline = time.monotonic() + app.state.fetch_timeout
         try:
-            async with asyncio.timeout(app.state.fetch_timeout):
+            async with asyncio.timeout_at(deadline):
                 resolver = app.state.resolver or _resolver()
                 if playerprops:
                     downloaded = await download_playerprops(
@@ -76,6 +78,7 @@ def create_app(
                         resolver=resolver,
                         transport=app.state.transport,
                         max_bytes=app.state.max_bytes,
+                        deadline=deadline,
                     )
                 else:
                     downloaded = await download_audio(
