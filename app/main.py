@@ -2,38 +2,31 @@
 
 from __future__ import annotations
 
-import ipaddress
+import asyncio
 import os
-import secrets
+import tempfile
 import uuid
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.download import DEFAULT_MAX_BYTES, LinkError, download_audio, normalize_audio_url
-from app.library import Library, TrackNotFound, title_from_filename, total_bytes
+from app.guard import SlidingRateLimit, client_address, same_origin
+from app.library import title_from_filename
 from app.tags import read_tags
 
 STATIC = Path(__file__).resolve().parent / "static"
-_UNSET = object()
+FETCH_TIMEOUT_SECONDS = 20.0
+RATE_LIMIT = 10
+RATE_WINDOW_SECONDS = 60.0
 
 
 class LinkIn(BaseModel):
     url: str
-
-
-def is_loopback_bind(host: str) -> bool:
-    value = str(host or "").strip().strip("[]").lower()
-    if value in {"localhost", "127.0.0.1", "::1"}:
-        return True
-    try:
-        return ipaddress.ip_address(value).is_loopback
-    except ValueError:
-        return False
 
 
 def create_app(
@@ -42,116 +35,88 @@ def create_app(
     resolver=None,
     transport=None,
     max_bytes: int | None = None,
-    bind_host: str | None = None,
-    token: str | None | object = _UNSET,
+    fetch_timeout: float = FETCH_TIMEOUT_SECONDS,
 ) -> FastAPI:
-    root = Path(library_dir) if library_dir is not None else Path(os.environ.get("PIXEL_LIBRARY", "library"))
-    library = Library(root)
-    if bind_host is None:
-        bind_host = os.environ.get("PIXEL_HOST", "127.0.0.1")
-    if token is _UNSET:
-        token = os.environ.get("PIXEL_TOKEN") or None
-    if isinstance(token, str):
-        token = token.strip() or None
-    exposed = not is_loopback_bind(bind_host)
-    if exposed and not token:
-        raise RuntimeError(
-            "Set PIXEL_TOKEN before listening beyond localhost. Refusing to start without it."
-        )
-    token_required = exposed or bool(token)
+    scratch_root = Path(library_dir) if library_dir is not None else Path(tempfile.mkdtemp(prefix="pixel-music-"))
+    scratch = scratch_root / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
     app = FastAPI(title="Pixel Music", docs_url=None, redoc_url=None)
-    app.state.library = library
+    app.state.scratch = scratch
     app.state.resolver = resolver
     app.state.transport = transport
-    app.state.bind_host = bind_host
-    app.state.token = token
-    app.state.token_required = token_required
+    app.state.fetch_timeout = fetch_timeout
+    app.state.limiter = SlidingRateLimit(RATE_LIMIT, RATE_WINDOW_SECONDS)
     app.state.max_bytes = int(os.environ.get("PIXEL_MAX_BYTES", DEFAULT_MAX_BYTES) if max_bytes is None else max_bytes)
-
-    @app.middleware("http")
-    async def require_token(request: Request, call_next):
-        if token_required and request.url.path.startswith("/api/"):
-            if not _token_ok(request, str(token or "")):
-                return JSONResponse({"detail": "Missing or invalid token."}, status_code=401)
-        return await call_next(request)
 
     @app.exception_handler(LinkError)
     async def link_error(_request, exc: LinkError):
         return JSONResponse({"detail": exc.message}, status_code=exc.status)
 
-    @app.get("/api/tracks")
-    def list_tracks():
-        tracks = library.list_tracks()
-        return JSONResponse(
-            {"tracks": tracks, "totalBytes": total_bytes(tracks)},
-            headers={"Cache-Control": "no-store"},
-        )
-
-    @app.post("/api/tracks")
-    async def add_track(body: LinkIn):
+    @app.post("/api/fetch")
+    async def fetch_audio(body: LinkIn, request: Request):
+        """Validate a direct file link and stream it back. Nothing is stored."""
+        if not same_origin(request):
+            raise LinkError("Fetch only works from this app.", status=403)
         normalized = normalize_audio_url(body.url)
-        existing = library.find_by_source_url(normalized)
-        if existing:
-            return JSONResponse({"track": existing, "created": False}, status_code=200)
-        tmp = library.media / f".partial-{uuid.uuid4().hex}"
+        if not app.state.limiter.allow(client_address(request)):
+            raise LinkError("Too many downloads from this address. Wait a minute and try again.", status=429)
+        tmp = scratch / f"{uuid.uuid4().hex}.bin"
         try:
-            downloaded = await download_audio(
-                normalized,
-                tmp,
-                resolver=app.state.resolver or _resolver(),
-                transport=app.state.transport,
-                max_bytes=app.state.max_bytes,
-            )
-            try:
-                tags = read_tags(tmp)
-            except Exception:
-                tags = {"title": "", "artist": "", "duration": None, "artwork": None}
-            artwork = tags.get("artwork")
-            art_bytes = artwork[0] if artwork and artwork[0] else None
-            art_mime = artwork[1] if artwork else None
-            track, created = library.adopt_file(
-                tmp,
-                source_url=normalized,
-                filename=downloaded.filename,
-                mime_type=downloaded.mime_type,
-                title=tags.get("title") or title_from_filename(downloaded.filename),
-                artist=tags.get("artist") or "Unknown artist",
-                duration=tags.get("duration"),
-                artwork=art_bytes,
-                artwork_mime=art_mime,
-            )
-        finally:
+            async with asyncio.timeout(app.state.fetch_timeout):
+                downloaded = await download_audio(
+                    normalized,
+                    tmp,
+                    resolver=app.state.resolver or _resolver(),
+                    transport=app.state.transport,
+                    max_bytes=app.state.max_bytes,
+                )
+                try:
+                    tags = read_tags(tmp)
+                except Exception:
+                    tags = {"title": "", "artist": "", "duration": None, "artwork": None}
+        except TimeoutError:
             tmp.unlink(missing_ok=True)
-        return JSONResponse({"track": track, "created": created}, status_code=201 if created else 200)
+            raise LinkError("That download took too long. Nothing was saved.", status=504) from None
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        audio_size = tmp.stat().st_size
+        artwork = tags.get("artwork")
+        art_bytes = b""
+        art_mime = ""
+        if artwork and artwork[0]:
+            candidate = bytes(artwork[0])
+            if len(candidate) + audio_size <= app.state.max_bytes:
+                art_bytes = candidate
+                art_mime = artwork[1] or "image/jpeg"
+        duration = tags.get("duration")
+        headers = {
+            "Cache-Control": "no-store",
+            "X-Pixel-Title": quote(tags.get("title") or title_from_filename(downloaded.filename), safe=""),
+            "X-Pixel-Artist": quote(tags.get("artist") or "Unknown artist", safe=""),
+            "X-Pixel-Duration": "" if not duration else str(duration),
+            "X-Pixel-Filename": quote(downloaded.filename, safe=""),
+            "X-Pixel-Mime": downloaded.mime_type,
+            "X-Pixel-Source-Url": quote(normalized, safe=""),
+            "X-Pixel-Artwork-Length": str(len(art_bytes)),
+            "X-Pixel-Artwork-Mime": art_mime,
+            "X-Pixel-Audio-Length": str(audio_size),
+        }
 
-    @app.delete("/api/tracks/{track_id}")
-    def delete_track(track_id: str):
-        try:
-            library.delete(track_id)
-        except TrackNotFound:
-            raise HTTPException(status_code=404, detail="That track isn't in the library.") from None
-        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+        async def chunks():
+            try:
+                if art_bytes:
+                    yield art_bytes
+                with tmp.open("rb") as handle:
+                    while True:
+                        block = await asyncio.to_thread(handle.read, 65536)
+                        if not block:
+                            break
+                        yield block
+            finally:
+                tmp.unlink(missing_ok=True)
 
-    @app.get("/api/tracks/{track_id}/audio")
-    def track_audio(track_id: str):
-        track = _track_or_404(library, track_id)
-        path = library.audio_path(track)
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="That audio file is missing from storage.")
-        return FileResponse(
-            path,
-            media_type=track.get("mimeType") or "application/octet-stream",
-            filename=track.get("filename") or path.name,
-            content_disposition_type="inline",
-        )
-
-    @app.get("/api/tracks/{track_id}/artwork")
-    def track_artwork(track_id: str):
-        track = _track_or_404(library, track_id)
-        path = library.artwork_path(track)
-        if not track.get("artworkSize") or not path.is_file():
-            raise HTTPException(status_code=404, detail="That track has no artwork.")
-        return FileResponse(path, media_type=track.get("artworkMime") or "application/octet-stream")
+        return StreamingResponse(chunks(), media_type="application/octet-stream", headers=headers)
 
     @app.get("/")
     @app.get("/index.html")
@@ -181,28 +146,6 @@ def _resolver():
     from app.download import default_resolver
 
     return default_resolver
-
-
-def _token_ok(request: Request, expected: str) -> bool:
-    presented = ""
-    authorization = request.headers.get("authorization", "")
-    if authorization.lower().startswith("bearer "):
-        presented = authorization[7:].strip()
-    if not presented:
-        cookie = request.cookies.get("pixel_token", "")
-        presented = unquote(cookie) if cookie else ""
-    if not presented:
-        presented = request.query_params.get("token", "")
-    if not presented or not expected or len(presented) != len(expected):
-        return False
-    return secrets.compare_digest(presented, expected)
-
-
-def _track_or_404(library: Library, track_id: str) -> dict:
-    try:
-        return library.get(track_id)
-    except TrackNotFound:
-        raise HTTPException(status_code=404, detail="That track isn't in the library.") from None
 
 
 app = create_app()

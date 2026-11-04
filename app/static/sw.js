@@ -1,9 +1,10 @@
-const CACHE = "pixel-music-shell-v1";
+const CACHE = "pixel-music-shell-v2";
 const ASSETS = [
   "./",
   "./index.html",
   "./css/app.css",
   "./js/app.js",
+  "./js/db.js",
   "./manifest.json",
   "./fonts/PressStart2P-Regular.woff2",
   "./fonts/Silkscreen-Regular.woff2",
@@ -30,8 +31,7 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
-  // Audio, artwork, and the library API must stay live. Range requests for
-  // seeking break if a service worker caches them.
+  // The fetch endpoint streams a file once. Do not cache it.
   if (url.pathname.startsWith("/api/")) return;
   event.respondWith(networkFirst(event.request));
 });

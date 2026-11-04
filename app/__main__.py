@@ -1,8 +1,7 @@
-"""Run the player. The bind address and the token stay in the environment.
+"""Run the player.
 
-PIXEL_HOST defaults to 127.0.0.1. Set PIXEL_TOKEN before using any other host,
-or before publishing a tunnel to this port. The token is not read from a file
-in the repo.
+PIXEL_HOST defaults to 127.0.0.1. Songs stay in the browser. Anyone who can
+open the site can ask this process to fetch a file URL.
 """
 
 from __future__ import annotations

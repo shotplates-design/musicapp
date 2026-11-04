@@ -117,7 +117,9 @@ img, .art { image-rendering: pixelated; }
   box-shadow: var(--shadow);
   padding: 8px;
   color: var(--cyan);
-  white-space: nowrap;
+  white-space: pre-line;
+  text-align: right;
+  max-width: 46%;
 }
 
 .stage {

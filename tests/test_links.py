@@ -49,10 +49,22 @@ def client_for(tmp_path, handler, *, resolver=None, max_bytes=80 * 1024 * 1024):
         transport=httpx.MockTransport(handler),
         max_bytes=max_bytes,
     )
-    return TestClient(application), application
+    return TestClient(
+        application,
+        headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+    ), application
 
 
-def test_saves_direct_audio_reads_tags_and_sorts_newest_first(tmp_path, monkeypatch):
+def split_fetch(response):
+    assert response.status_code == 200, response.text
+    art_len = int(response.headers["x-pixel-artwork-length"])
+    body = response.content
+    return body[:art_len], body[art_len:]
+
+
+def test_streams_audio_and_tags_without_storing_them(tmp_path):
+    from urllib.parse import unquote
+
     wav = make_wav()
     mp3 = make_tagged_mp3(tmp_path)
     calls = {"n": 0}
@@ -65,62 +77,28 @@ def test_saves_direct_audio_reads_tags_and_sorts_newest_first(tmp_path, monkeypa
             return httpx.Response(200, headers={"Content-Type": "audio/mpeg"}, content=mp3)
         raise AssertionError(request.url)
 
-    ticks = iter([1_000, 5_000])
-    monkeypatch.setattr("app.library.now_ms", lambda: next(ticks))
     client, application = client_for(tmp_path, handler)
 
-    first = client.post("/api/tracks", json={"url": "https://cdn.example.com/My_Song.wav?token=1"})
-    assert first.status_code == 201, first.text
-    saved = first.json()["track"]
-    assert saved["title"] == "My Song"
-    assert saved["artist"] == "Unknown artist"
-    assert saved["source"] == "link"
-    assert saved["mimeType"] == "audio/wav"
-    assert 0.4 < saved["duration"] < 0.6
-    assert saved["byteSize"] == len(wav)
-    assert saved["artworkSize"] == 0
+    first = client.post("/api/fetch", json={"url": "https://cdn.example.com/My_Song.wav?token=1"})
+    artwork, audio = split_fetch(first)
+    assert artwork == b""
+    assert audio == wav
+    assert unquote(first.headers["x-pixel-title"]) == "My Song"
+    assert unquote(first.headers["x-pixel-artist"]) == "Unknown artist"
+    assert first.headers["x-pixel-mime"] == "audio/wav"
+    assert 0.4 < float(first.headers["x-pixel-duration"]) < 0.6
+    assert int(first.headers["x-pixel-audio-length"]) == len(wav)
 
-    second = client.post("/api/tracks", json={"url": "https://cdn.example.com/night.mp3"})
-    assert second.status_code == 201, second.text
-    tagged = second.json()["track"]
-    assert tagged["title"] == "Night Drive"
-    assert tagged["artist"] == "Pixel Band"
-    assert tagged["artworkSize"] == 4
-    assert tagged["artworkMime"] == "image/jpeg"
-    assert tagged["duration"] > 0
-
-    listing = client.get("/api/tracks")
-    assert listing.status_code == 200
-    body = listing.json()
-    assert [track["id"] for track in body["tracks"]] == [tagged["id"], saved["id"]]
-    assert body["totalBytes"] == saved["byteSize"] + tagged["byteSize"] + tagged["artworkSize"]
-
-    audio = client.get(f"/api/tracks/{saved['id']}/audio", headers={"Range": "bytes=0-3"})
-    assert audio.status_code == 206
-    assert audio.content == b"RIFF"
-    assert audio.headers["accept-ranges"] == "bytes"
-    assert "inline" in audio.headers["content-disposition"]
-
-    art = client.get(f"/api/tracks/{tagged['id']}/artwork")
-    assert art.status_code == 200
-    assert art.headers["content-type"].startswith("image/jpeg")
-    assert art.content == b"\xff\xd8\xff\xd9"
-
-    duplicate = client.post("/api/tracks", json={"url": "https://cdn.example.com/night.mp3"})
-    assert duplicate.status_code == 200
-    assert duplicate.json()["created"] is False
-    assert duplicate.json()["track"]["id"] == tagged["id"]
+    second = client.post("/api/fetch", json={"url": "https://cdn.example.com/night.mp3"})
+    cover, tagged = split_fetch(second)
+    assert tagged == mp3
+    assert cover == b"\xff\xd8\xff\xd9"
+    assert unquote(second.headers["x-pixel-title"]) == "Night Drive"
+    assert unquote(second.headers["x-pixel-artist"]) == "Pixel Band"
+    assert second.headers["x-pixel-artwork-mime"] == "image/jpeg"
+    assert float(second.headers["x-pixel-duration"]) > 0
     assert calls["n"] == 2
-
-    deleted = client.delete(f"/api/tracks/{tagged['id']}")
-    assert deleted.status_code == 200
-    assert client.get(f"/api/tracks/{tagged['id']}/audio").status_code == 404
-    assert client.get(f"/api/tracks/{tagged['id']}/artwork").status_code == 404
-    remaining = client.get("/api/tracks").json()["tracks"]
-    assert [track["id"] for track in remaining] == [saved["id"]]
-    media = list(application.state.library.media.iterdir())
-    assert len(media) == 1
-    assert media[0].name.endswith(".wav")
+    assert list(application.state.scratch.iterdir()) == []
 
 
 def test_rejects_streaming_services_private_addresses_and_non_audio(tmp_path):
@@ -140,7 +118,7 @@ def test_rejects_streaming_services_private_addresses_and_non_audio(tmp_path):
         "https://audio-ssl.itunes.apple.com/song.m4a",
     ]
     for url in blocked:
-        response = client.post("/api/tracks", json={"url": url})
+        response = client.post("/api/fetch", json={"url": url})
         assert response.status_code == 400, url
         assert "YouTube, Spotify, and Apple Music" in response.json()["detail"]
 
@@ -154,15 +132,15 @@ def test_rejects_streaming_services_private_addresses_and_non_audio(tmp_path):
         "https://user:secret@cdn.example.com/a.mp3",
     ]
     for url in private_urls:
-        response = client.post("/api/tracks", json={"url": url})
+        response = client.post("/api/fetch", json={"url": url})
         assert response.status_code == 400, url
         assert "Nothing was saved" not in response.json()["detail"] or "allowed" in response.json()["detail"].lower() or "aren't allowed" in response.json()["detail"]
 
-    page = client.post("/api/tracks", json={"url": "https://cdn.example.com/download"})
+    page = client.post("/api/fetch", json={"url": "https://cdn.example.com/download"})
     assert page.status_code == 400
     assert "direct audio file" in page.json()["detail"]
 
-    html = client.post("/api/tracks", json={"url": "https://cdn.example.com/song.mp3"})
+    html = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.mp3"})
     assert html.status_code == 400
     assert "didn't return audio" in html.json()["detail"]
     assert calls["n"] == 1
@@ -175,7 +153,7 @@ def test_rejects_streaming_services_private_addresses_and_non_audio(tmp_path):
         handler,
         resolver=private_dns,
     )
-    dns = dns_client.post("/api/tracks", json={"url": "https://cdn.example.com/secret.mp3"})
+    dns = dns_client.post("/api/fetch", json={"url": "https://cdn.example.com/secret.mp3"})
     assert dns.status_code == 400
     assert "isn't allowed" in dns.json()["detail"]
 
@@ -186,13 +164,12 @@ def test_rejects_streaming_services_private_addresses_and_non_audio(tmp_path):
         return httpx.Response(302, headers={"Location": "http://127.0.0.1/secret.wav"})
 
     redirect_client, redirect_app = client_for(tmp_path / "redir", redirect_handler)
-    redirected = redirect_client.post("/api/tracks", json={"url": "https://cdn.example.com/start.mp3"})
+    redirected = redirect_client.post("/api/fetch", json={"url": "https://cdn.example.com/start.mp3"})
     assert redirected.status_code == 400
     assert "isn't allowed" in redirected.json()["detail"]
-    assert redirect_app.state.library.list_tracks() == []
     assert redirect_calls["n"] == 1
-    assert list(redirect_app.state.library.media.iterdir()) == []
-    assert application.state.library.list_tracks() == []
+    assert list(redirect_app.state.scratch.iterdir()) == []
+    assert list(application.state.scratch.iterdir()) == []
 
 
 def test_enforces_size_limit_and_does_not_keep_a_partial_file(tmp_path):
@@ -200,17 +177,16 @@ def test_enforces_size_limit_and_does_not_keep_a_partial_file(tmp_path):
         return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=b"RIFFxxxx" + b"\x00" * 200)
 
     client, application = client_for(tmp_path, handler, max_bytes=32)
-    response = client.post("/api/tracks", json={"url": "https://cdn.example.com/big.wav"})
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/big.wav"})
     assert response.status_code == 413
     assert "limit" in response.json()["detail"]
     assert "Nothing was saved" in response.json()["detail"]
-    assert application.state.library.list_tracks() == []
-    assert list(application.state.library.media.iterdir()) == []
+    assert list(application.state.scratch.iterdir()) == []
 
 
 def test_missing_url_field(tmp_path):
     client, _application = client_for(tmp_path, lambda request: httpx.Response(500))
-    response = client.post("/api/tracks", json={})
+    response = client.post("/api/fetch", json={})
     assert response.status_code == 422
 
 
@@ -220,7 +196,11 @@ def test_no_streaming_rippers_in_requirements():
         assert banned not in text
 
 
-def test_delete_unknown_track(tmp_path):
-    client, _application = client_for(tmp_path, lambda request: httpx.Response(500))
-    response = client.delete("/api/tracks/not-a-uuid")
-    assert response.status_code == 404
+def test_default_cap_fits_under_vercel_hobby_response_limit():
+    from app.download import DEFAULT_MAX_BYTES, _size_message
+
+    assert DEFAULT_MAX_BYTES == 4 * 1024 * 1024
+    assert DEFAULT_MAX_BYTES < 4_500_000
+    message = _size_message(DEFAULT_MAX_BYTES)
+    assert "4 MB" in message
+    assert "4.5 MB" in message
