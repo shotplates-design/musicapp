@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.artists import detect_artist
 from app.download import DEFAULT_MAX_BYTES, LinkError
 from app.guard import SlidingRateLimit, client_address, same_origin
 from app.library import title_from_filename
@@ -96,10 +97,18 @@ def create_app(
                 art_bytes = candidate
                 art_mime = artwork[1] or "image/jpeg"
         duration = tags.get("duration")
+        info = dict(getattr(downloaded, "info", None) or {})
+        filename_title = title_from_filename(downloaded.filename)
+        display_title = tags.get("title") or filename_title
+        artist = detect_artist(
+            info=info,
+            tag_artist=tags.get("artist") or "",
+            titles=(tags.get("title") or "", info.get("title") or "", filename_title),
+        )
         headers = {
             "Cache-Control": "no-store",
-            "X-Pixel-Title": quote(tags.get("title") or title_from_filename(downloaded.filename), safe=""),
-            "X-Pixel-Artist": quote(tags.get("artist") or "Unknown artist", safe=""),
+            "X-Pixel-Title": quote(display_title, safe=""),
+            "X-Pixel-Artist": quote(artist, safe=""),
             "X-Pixel-Duration": "" if not duration else str(duration),
             "X-Pixel-Filename": quote(downloaded.filename, safe=""),
             "X-Pixel-Mime": downloaded.mime_type,

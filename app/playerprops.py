@@ -84,6 +84,7 @@ def download_audio(url, output_path):
         "outtmpl": output_path,
         "noplaylist": True,
         "quiet": False,
+        "progress_hooks": [_capture_download_info],
     }
     # Generic extractor only, so a page cannot hand off to YouTube or Spotify.
     ydl_opts["allowed_extractors"] = ["generic"]
@@ -120,6 +121,26 @@ def _remember(kind: str) -> None:
     job = _job.get()
     if job is not None:
         job["error"] = kind
+
+
+def _remember_info(info: dict) -> None:
+    job = _job.get()
+    if job is None or not isinstance(info, dict):
+        return
+    job["info"] = {
+        "artist": info.get("artist"),
+        "creator": info.get("creator"),
+        "uploader": info.get("uploader"),
+        "title": info.get("title"),
+    }
+
+
+def _capture_download_info(status: dict) -> None:
+    if not isinstance(status, dict) or status.get("status") not in {"downloading", "finished"}:
+        return
+    info = status.get("info_dict")
+    if isinstance(info, dict):
+        _remember_info(info)
 
 
 def _pin_ydl(ydl) -> None:
@@ -165,6 +186,7 @@ async def download_playerprops(url, dest, *, resolver, transport, max_bytes, dea
             mime_type="audio/mp4",
             filename=safe_filename(saved.stem, "m4a"),
             extension="m4a",
+            info=dict(job.get("info") or {}),
         )
     finally:
         _job.reset(token)

@@ -1,12 +1,16 @@
-import { deleteTrackData, getMedia, listTracks, saveTrack } from "./db.js";
+import { deleteTrackData, getMedia, listPlaylists, listTracks, replacePlaylists, saveTrack } from "./db.js";
 
 const audio = document.querySelector("#audio");
 const view = document.querySelector("#view");
 const seek = document.querySelector("#seek");
 
+const UNKNOWN_ARTIST = "Unknown Artist";
+
 const state = {
   tab: "library",
   tracks: [],
+  playlists: [],
+  playlistId: null,
   currentId: null,
   queue: [],
   queueIndex: 0,
@@ -63,6 +67,45 @@ const artUrls = new Map();
 
 function sortTracks(tracks) {
   return tracks.slice().sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0) || String(a.title).localeCompare(String(b.title)));
+}
+
+function normalizeArtist(name) {
+  const text = String(name || "").replace(/\u0000/g, " ").replace(/\s+/g, " ").trim();
+  return text || UNKNOWN_ARTIST;
+}
+
+function artistKey(name) {
+  return normalizeArtist(name).toLowerCase();
+}
+
+function findArtistPlaylist(playlists, artist) {
+  const key = artistKey(artist);
+  return playlists.find((playlist) => (playlist.artistKey || artistKey(playlist.name)) === key) || null;
+}
+
+function addSongToArtistPlaylist(playlists, artist, trackId) {
+  const name = normalizeArtist(artist);
+  const existing = findArtistPlaylist(playlists, name);
+  if (existing) {
+    const ids = Array.isArray(existing.trackIds) ? existing.trackIds.slice() : [];
+    if (!ids.includes(trackId)) ids.push(trackId);
+    existing.trackIds = ids;
+    if (!existing.artistKey) existing.artistKey = artistKey(name);
+    return existing;
+  }
+  const created = { id: createId(), name, artistKey: artistKey(name), trackIds: [trackId] };
+  playlists.push(created);
+  return created;
+}
+
+function sortPlaylists(playlists) {
+  const unknown = artistKey(UNKNOWN_ARTIST);
+  return playlists.slice().sort((a, b) => {
+    const aUnknown = artistKey(a.name) === unknown;
+    const bUnknown = artistKey(b.name) === unknown;
+    if (aUnknown !== bUnknown) return aUnknown ? 1 : -1;
+    return String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" });
+  });
 }
 
 function createId() {
@@ -133,6 +176,21 @@ async function refreshStorage() {
   node.textContent = line;
 }
 
+function syncArtistPlaylists(tracks, playlists) {
+  const live = new Set(tracks.map((track) => track.id));
+  for (const playlist of playlists) {
+    playlist.trackIds = (playlist.trackIds || []).filter((id) => live.has(id));
+    if (!playlist.artistKey) playlist.artistKey = artistKey(playlist.name);
+  }
+  const assigned = new Set(playlists.flatMap((playlist) => playlist.trackIds));
+  for (const track of tracks) {
+    if (assigned.has(track.id)) continue;
+    addSongToArtistPlaylist(playlists, track.artist, track.id);
+    assigned.add(track.id);
+  }
+  return sortPlaylists(playlists.filter((playlist) => playlist.trackIds.length));
+}
+
 async function refresh() {
   const tracks = sortTracks(await listTracks());
   for (const track of tracks) {
@@ -141,6 +199,11 @@ async function refresh() {
     artUrls.set(track.id, media?.artwork ? URL.createObjectURL(media.artwork) : "");
   }
   state.tracks = tracks;
+  state.playlists = syncArtistPlaylists(tracks, await listPlaylists());
+  if (state.playlistId && !state.playlists.some((playlist) => playlist.id === state.playlistId)) {
+    state.playlistId = null;
+  }
+  await replacePlaylists(state.playlists);
   await refreshStorage();
   renderView();
   updatePlayerChrome();
@@ -202,7 +265,7 @@ async function addLink(event) {
   const meta = {
     id: createId(),
     title: headerText(response, "x-pixel-title") || "Untitled",
-    artist: headerText(response, "x-pixel-artist") || "Unknown artist",
+    artist: headerText(response, "x-pixel-artist") || UNKNOWN_ARTIST,
     duration: Number.isFinite(duration) && duration > 0 ? duration : null,
     mimeType: mime,
     byteSize: audioBytes.byteLength,
@@ -228,7 +291,8 @@ async function addLink(event) {
   state.busy = false;
   state.draftUrl = "";
   state.tab = "library";
-  toast("Saved on this phone.");
+  state.playlistId = null;
+  toast(`Saved to ${meta.artist}.`);
   try {
     await refresh();
   } catch {
@@ -488,17 +552,70 @@ function renderView() {
   renderModal();
 }
 
+function playlistTracks(playlist) {
+  const ids = new Set(playlist.trackIds || []);
+  return state.tracks.filter((track) => ids.has(track.id));
+}
+
+function openPlaylist(id) {
+  state.playlistId = id;
+  renderView();
+}
+
 function renderLibrary() {
   if (!state.tracks.length) {
     view.append(el("section", { class: "panel" }, [
       el("h2", { text: "Library" }),
-        el("p", { class: "help", text: "No tracks yet. A saved song stays on this phone and can play offline." }),
+      el("p", { class: "help", text: "No tracks yet. A saved song stays on this phone, in a playlist named for the artist, and can play offline." }),
       el("button", { class: "btn", type: "button", text: "Add a link", onclick: () => setTab("add") }),
     ]));
     return;
   }
-  view.append(el("h2", { text: "Library" }));
-  for (const track of state.tracks) {
+  const open = state.playlists.find((playlist) => playlist.id === state.playlistId);
+  if (open) {
+    renderPlaylist(open);
+    return;
+  }
+  view.append(el("h2", { text: "Artists" }));
+  for (const playlist of state.playlists) {
+    const songs = playlistTracks(playlist);
+    const count = songs.length;
+    view.append(el("article", { class: "card" }, [
+      artNode(songs.find((track) => artUrls.get(track.id)) || null),
+      el("div", { class: "body" }, [
+        el("p", { class: "track-title", text: playlist.name }),
+        el("p", { class: "meta", text: count === 1 ? "1 song" : `${count} songs` }),
+      ]),
+      el("div", { class: "row-actions" }, [
+        el("button", {
+          class: "btn",
+          type: "button",
+          text: "Open",
+          onclick: () => openPlaylist(playlist.id),
+        }),
+        el("button", {
+          class: "btn",
+          type: "button",
+          text: "Play",
+          onclick: () => { void playIds(songs.map((track) => track.id), 0); },
+        }),
+      ]),
+    ]));
+  }
+}
+
+function renderPlaylist(playlist) {
+  const songs = playlistTracks(playlist);
+  view.append(el("div", { class: "inline" }, [
+    el("button", {
+      class: "btn ghost",
+      type: "button",
+      text: "Artists",
+      onclick: () => { state.playlistId = null; renderView(); },
+    }),
+  ]));
+  view.append(el("h2", { text: playlist.name }));
+  for (const track of songs) {
     const playing = state.currentId === track.id && !audio.paused;
     view.append(el("article", { class: "card" }, [
       artNode(track),
@@ -520,7 +637,8 @@ function renderLibrary() {
               audio.paused ? audio.play().catch(() => toast("Tap Play to start.")) : audio.pause();
               return;
             }
-            void playIds(state.tracks.map((item) => item.id), state.tracks.indexOf(track));
+            const songs = playlistTracks(playlist);
+            void playIds(songs.map((item) => item.id), songs.indexOf(track));
           },
         }),
         el("button", { class: "btn danger", type: "button", text: "Del", onclick: () => confirmDelete(track) }),
@@ -534,7 +652,7 @@ function renderAdd() {
     el("h2", { text: "Add a link" }),
     el("p", {
       class: "help",
-      text: "Only playerprops.com links are supported. The file is saved on this phone as M4A and plays here. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB.",
+      text: "Only playerprops.com links are supported. The file is saved on this phone as M4A, in a playlist for the artist, and plays here. Files over 4 MB are refused: a streamed Vercel Hobby response still cannot exceed 4.5 MB.",
     }),
     el("form", { class: "form", onsubmit: (event) => { void addLink(event); } }, [
       el("label", { class: "field", for: "audio-url" }, [
