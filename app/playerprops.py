@@ -13,6 +13,7 @@ to a temporary directory and removed before this function returns.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import tempfile
 import time
@@ -20,16 +21,18 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import httpx
+import yt_dlp
+from yt_dlp.utils import DownloadError
 
 from app.download import (
     DEFAULT_MAX_BYTES,
     MAX_REDIRECTS,
     REDIRECTS,
+    DownloadedAudio,
     LinkError,
     _host_header,
     _pinned_url,
     _size_message,
-    download_audio,
     guard_remote_url,
     prepare_public_url,
     resolve_public,
@@ -70,27 +73,109 @@ def canonical_playerprops_url(url: str) -> str:
     return canonical
 
 
+# Set by the caller so download_audio can pin connections without extra arguments.
+_job = contextvars.ContextVar("pixel_ydl_job", default=None)
+
+
+def download_audio(url, output_path):
+    """Download one page with yt-dlp. Same shape as the playerprops script."""
+    ydl_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "outtmpl": output_path,
+        "noplaylist": True,
+        "quiet": False,
+    }
+    # Generic extractor only, so a page cannot hand off to YouTube or Spotify.
+    ydl_opts["allowed_extractors"] = ["generic"]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _pin_ydl(ydl)
+            ydl.download([url])
+        print(f"Successfully downloaded: {url}")
+        return True
+    except DownloadError as e:
+        cause = _linked_error(e)
+        if isinstance(cause, LinkError):
+            raise cause from e
+        error_message = str(e)
+        if "DRM protected" in error_message:
+            print(f"Skipping DRM-protected track: {url}")
+            _remember("drm")
+            return False
+        print(f"Download failed: {error_message}")
+        _remember("fail")
+        return False
+    except Exception as e:
+        if isinstance(e, LinkError):
+            raise
+        cause = _linked_error(e)
+        if isinstance(cause, LinkError):
+            raise cause from e
+        print(f"Unexpected error: {e}")
+        _remember("fail")
+        return False
+
+
+def _remember(kind: str) -> None:
+    job = _job.get()
+    if job is not None:
+        job["error"] = kind
+
+
+def _pin_ydl(ydl) -> None:
+    """Attach the public-address handler. No-op when this process has no job."""
+    job = _job.get()
+    if job is None or not hasattr(ydl, "_request_director"):
+        return
+    director = ydl._request_director
+    if "_Pinned" in director.handlers:
+        return
+    director.add_handler(make_pinned_handler(
+        resolver=job["resolver"],
+        deadline=job["deadline"],
+        transport=job["transport"],
+        max_bytes=job["max_bytes"],
+        logger=director.logger,
+    ))
+    director.preferences.add(lambda handler, _request: 10000 if handler.RH_KEY == "_Pinned" else 0)
+
+
 async def download_playerprops(url, dest, *, resolver, transport, max_bytes, deadline):
-    """Resolve one playerprops page, then download its public audio file."""
+    """Check the host, run download_audio into /tmp, and hand the .m4a back."""
     page = canonical_playerprops_url(url)
     guard_remote_url(page, resolver)
-    info = await asyncio.to_thread(_extract, page, resolver, deadline, transport, max_bytes)
-    _reject_drm(info)
-    _reject_playlist(info)
-    _reject_stream(info)
-    media = str(info.get("url") or "").strip()
-    if not media:
+    folder = tempfile.TemporaryDirectory(prefix="pixel-ydl-", dir="/tmp")
+    job = {"resolver": resolver, "deadline": deadline, "transport": transport, "max_bytes": max_bytes, "error": ""}
+    token = _job.set(job)
+    try:
+        outtmpl = str(Path(folder.name) / "%(title)s.%(ext)s")
+        ok = await asyncio.to_thread(download_audio, page, outtmpl)
+        if not ok:
+            if job["error"] == "drm":
+                raise LinkError("That track is DRM-protected. Nothing was saved.")
+            raise LinkError("Couldn't read that playerprops page. Nothing was saved.")
+        saved = _newest_file(Path(folder.name))
+        size = saved.stat().st_size
+        if size > max_bytes:
+            raise LinkError(_size_message(max_bytes), status=413)
+        if size <= 0:
+            raise LinkError("That file was empty. Nothing was saved.")
+        dest.write_bytes(saved.read_bytes())
+        return DownloadedAudio(
+            mime_type="audio/mp4",
+            filename=safe_filename(saved.stem, "m4a"),
+            extension="m4a",
+        )
+    finally:
+        _job.reset(token)
+        folder.cleanup()
+
+
+def _newest_file(folder: Path) -> Path:
+    files = [path for path in folder.rglob("*") if path.is_file()]
+    if not files:
         raise LinkError("That page didn't include a file. Nothing was saved.")
-    title = str(info.get("title") or "").strip() or "track"
-    return await download_audio(
-        media,
-        dest,
-        resolver=resolver,
-        transport=transport,
-        max_bytes=max_bytes,
-        mime_type="audio/mp4",
-        filename=safe_filename(title, "m4a"),
-    )
+    return max(files, key=lambda path: path.stat().st_mtime)
 
 
 def _yt_dlp():
