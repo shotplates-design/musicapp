@@ -50,7 +50,7 @@ No environment variables and no Blob store. The Hobby plan is enough.
 
 1. Sign in at [vercel.com](https://vercel.com) with the GitHub account that has this repo.
 2. **Add New… → Project** and import this repository.
-3. Framework preset: **Other** (Vercel detects the FastAPI app from `pyproject.toml`: `api.index:app`).
+3. Framework preset: **Other**. Leave it as Python. Vercel installs the runtime packages from `requirements.txt` and from `[project].dependencies` in `pyproject.toml` (`fastapi`, `httpx`, `uvicorn`, `mutagen`). The app entry is `api.index:app`.
 4. Leave **Environment Variables** empty. Do not add a token.
 5. Deploy. Open the `https://….vercel.app` URL.
 

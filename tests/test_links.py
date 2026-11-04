@@ -196,6 +196,14 @@ def test_no_streaming_rippers_in_requirements():
         assert banned not in text
 
 
+def test_vercel_python_runtime_dependencies_are_declared():
+    requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()
+    project = Path("pyproject.toml").read_text(encoding="utf-8").lower()
+    for package in ("fastapi", "httpx", "uvicorn", "mutagen"):
+        assert package in requirements
+        assert package in project
+
+
 def test_default_cap_fits_under_vercel_hobby_response_limit():
     from app.download import DEFAULT_MAX_BYTES, _size_message
 
