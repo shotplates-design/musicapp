@@ -1,3 +1,4 @@
+import asyncio
 import io
 import ipaddress
 import wave
@@ -34,7 +35,10 @@ def client_for(tmp_path, handler, *, resolver=None, max_bytes=80 * 1024 * 1024, 
         max_bytes=max_bytes,
         **app_kwargs,
     )
-    return TestClient(application), application
+    return TestClient(
+        application,
+        headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+    ), application
 
 
 def test_pins_the_validated_address_when_dns_changes(tmp_path):
@@ -214,21 +218,44 @@ def test_stored_size_is_the_body_not_a_short_content_length(tmp_path):
     assert response.content[art_len:] == wav
 
 
-def test_non_loopback_starts_without_a_token_and_warns(tmp_path, capsys):
+def test_fetch_rejects_other_origins_and_limits_each_address(tmp_path):
     wav = make_wav()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
 
-    client, _application = client_for(tmp_path, handler, bind_host="0.0.0.0")
-    warning = capsys.readouterr().err
-    assert "no login" in warning.lower()
-    assert "add and delete" in warning.lower()
-    fetched = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
-    assert fetched.status_code == 200, fetched.text
-    assert client.get("/").status_code == 200
+    client, application = client_for(tmp_path, handler)
+    missing = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"}, headers={"Origin": "", "Sec-Fetch-Site": ""})
+    assert missing.status_code == 403
+    assert "this app" in missing.json()["detail"]
 
-    capsys.readouterr()
-    local, _local_app = client_for(tmp_path / "local", handler, bind_host="127.0.0.1")
-    assert "WARNING" not in capsys.readouterr().err
-    assert local.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"}).status_code == 200
+    cross = client.post(
+        "/api/fetch",
+        json={"url": "https://cdn.example.com/song.wav"},
+        headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+    )
+    assert cross.status_code == 403
+
+    for _ in range(10):
+        ok = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+        assert ok.status_code == 200, ok.text
+    limited = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert limited.status_code == 429
+    assert "Wait a minute" in limited.json()["detail"]
+    assert list(application.state.scratch.iterdir()) == []
+
+
+def test_fetch_deadline_stops_a_slow_download(tmp_path, monkeypatch):
+    async def hang(*_args, **_kwargs):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr("app.main.download_audio", hang)
+    application = create_app(tmp_path / "slow", fetch_timeout=0.05)
+    client = TestClient(
+        application,
+        headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+    )
+    response = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.mp3"})
+    assert response.status_code == 504
+    assert "took too long" in response.json()["detail"]
+    assert list(application.state.scratch.iterdir()) == []

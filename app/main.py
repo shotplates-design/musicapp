@@ -3,42 +3,30 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import os
-import sys
 import tempfile
 import uuid
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.download import DEFAULT_MAX_BYTES, LinkError, download_audio, normalize_audio_url
+from app.guard import SlidingRateLimit, client_address, same_origin
 from app.library import title_from_filename
 from app.tags import read_tags
 
 STATIC = Path(__file__).resolve().parent / "static"
-EXPOSURE_WARNING = (
-    "WARNING: Pixel Music has no login. It is listening beyond localhost, "
-    "so anyone who can reach this computer can add and delete tracks and use the fetcher."
-)
+FETCH_TIMEOUT_SECONDS = 20.0
+RATE_LIMIT = 10
+RATE_WINDOW_SECONDS = 60.0
 
 
 class LinkIn(BaseModel):
     url: str
-
-
-def is_loopback_bind(host: str) -> bool:
-    value = str(host or "").strip().strip("[]").lower()
-    if value in {"localhost", "127.0.0.1", "::1"}:
-        return True
-    try:
-        return ipaddress.ip_address(value).is_loopback
-    except ValueError:
-        return False
 
 
 def create_app(
@@ -47,20 +35,17 @@ def create_app(
     resolver=None,
     transport=None,
     max_bytes: int | None = None,
-    bind_host: str | None = None,
+    fetch_timeout: float = FETCH_TIMEOUT_SECONDS,
 ) -> FastAPI:
     scratch_root = Path(library_dir) if library_dir is not None else Path(tempfile.mkdtemp(prefix="pixel-music-"))
     scratch = scratch_root / "scratch"
     scratch.mkdir(parents=True, exist_ok=True)
-    if bind_host is None:
-        bind_host = os.environ.get("PIXEL_HOST", "127.0.0.1")
-    if not is_loopback_bind(bind_host):
-        print(EXPOSURE_WARNING, file=sys.stderr)
     app = FastAPI(title="Pixel Music", docs_url=None, redoc_url=None)
     app.state.scratch = scratch
     app.state.resolver = resolver
     app.state.transport = transport
-    app.state.bind_host = bind_host
+    app.state.fetch_timeout = fetch_timeout
+    app.state.limiter = SlidingRateLimit(RATE_LIMIT, RATE_WINDOW_SECONDS)
     app.state.max_bytes = int(os.environ.get("PIXEL_MAX_BYTES", DEFAULT_MAX_BYTES) if max_bytes is None else max_bytes)
 
     @app.exception_handler(LinkError)
@@ -68,22 +53,30 @@ def create_app(
         return JSONResponse({"detail": exc.message}, status_code=exc.status)
 
     @app.post("/api/fetch")
-    async def fetch_audio(body: LinkIn):
+    async def fetch_audio(body: LinkIn, request: Request):
         """Validate a direct file link and stream it back. Nothing is stored."""
+        if not same_origin(request):
+            raise LinkError("Fetch only works from this app.", status=403)
         normalized = normalize_audio_url(body.url)
+        if not app.state.limiter.allow(client_address(request)):
+            raise LinkError("Too many downloads from this address. Wait a minute and try again.", status=429)
         tmp = scratch / f"{uuid.uuid4().hex}.bin"
         try:
-            downloaded = await download_audio(
-                normalized,
-                tmp,
-                resolver=app.state.resolver or _resolver(),
-                transport=app.state.transport,
-                max_bytes=app.state.max_bytes,
-            )
-            try:
-                tags = read_tags(tmp)
-            except Exception:
-                tags = {"title": "", "artist": "", "duration": None, "artwork": None}
+            async with asyncio.timeout(app.state.fetch_timeout):
+                downloaded = await download_audio(
+                    normalized,
+                    tmp,
+                    resolver=app.state.resolver or _resolver(),
+                    transport=app.state.transport,
+                    max_bytes=app.state.max_bytes,
+                )
+                try:
+                    tags = read_tags(tmp)
+                except Exception:
+                    tags = {"title": "", "artist": "", "duration": None, "artwork": None}
+        except TimeoutError:
+            tmp.unlink(missing_ok=True)
+            raise LinkError("That download took too long. Nothing was saved.", status=504) from None
         except Exception:
             tmp.unlink(missing_ok=True)
             raise

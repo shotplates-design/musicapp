@@ -1,8 +1,7 @@
 """Run the player.
 
-PIXEL_HOST defaults to 127.0.0.1. Any other host has no login: anyone who can
-reach the process can add and delete tracks and use the fetcher. create_app
-prints that warning when the bind address is not loopback.
+PIXEL_HOST defaults to 127.0.0.1. Songs stay in the browser. Anyone who can
+open the site can ask this process to fetch a file URL.
 """
 
 from __future__ import annotations

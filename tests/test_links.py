@@ -49,7 +49,10 @@ def client_for(tmp_path, handler, *, resolver=None, max_bytes=80 * 1024 * 1024):
         transport=httpx.MockTransport(handler),
         max_bytes=max_bytes,
     )
-    return TestClient(application), application
+    return TestClient(
+        application,
+        headers={"Origin": "http://testserver", "Sec-Fetch-Site": "same-origin"},
+    ), application
 
 
 def split_fetch(response):

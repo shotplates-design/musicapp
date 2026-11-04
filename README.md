@@ -38,7 +38,7 @@ Open `http://127.0.0.1:8000`. Paste a link on **Add**. The song is stored on thi
 
 `PIXEL_PORT` changes the port (the default is 8000). Nothing in this repo is a secret. Do not commit `.env`.
 
-**No login.** If you set `PIXEL_HOST` to anything other than loopback (`0.0.0.0`, a LAN address, and so on), the process prints a warning: anyone who can reach that address can add and delete tracks on the phones that use it, and can use the server to fetch a URL. A tunnel is the same idea. Do not share the address.
+**No login.** Songs stay in the browser, but anyone who can open the site can ask the server to fetch a file URL. Do not share a tunnel or LAN address. `/api/fetch` only accepts requests the browser marks as same-origin, and each address is limited to about 10 fetches a minute in one server process.
 
 ## Use it on an iPhone
 
@@ -54,7 +54,16 @@ No environment variables and no Blob store. The Hobby plan is enough.
 4. Leave **Environment Variables** empty. Do not add a token.
 5. Deploy. Open the `https://….vercel.app` URL.
 
-`vercel.json` allows the function 60 seconds, inside the Hobby maximum of 300 seconds.
+`vercel.json` allows the function 60 seconds, inside the Hobby maximum of 300 seconds. Each download also stops after 20 seconds.
+
+`/api/fetch` keeps a best-effort limit of 10 requests a minute per address in the function process. That memory is not shared by every Vercel instance or region, so it is not a global cap. Hobby includes one free [WAF rate-limiting rule](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting) (IP key, fixed window, 1,000,000 included requests). Add it yourself if you want the edge to enforce the same limit. This repo does not create the rule:
+
+1. Open the project, then **Firewall → Configure → + New Rule**.
+2. Name it `Limit fetch`. If the path starts with `/api/fetch`, choose **Rate Limit**.
+3. Fixed window, time window `60` seconds, request limit `10`, key **IP**, action **Deny** (429).
+4. Save, then **Review Changes → Publish**.
+
+That uses the one rate-limit rule included on Hobby. It is optional. The in-app limit still runs if you never publish it.
 
 ### Same Wi-Fi without Vercel
 
@@ -66,7 +75,7 @@ export PIXEL_SSL_KEYFILE=key.pem
 python -m app
 ```
 
-Create `cert.pem` and `key.pem` with [mkcert](https://github.com/FiloSottile/mkcert) for your LAN IP, install mkcert’s root on the iPhone (AirDrop `rootCA.pem`, install the profile, then Settings → General → About → Certificate Trust Settings), and open `https://<lan-ip>:8443`. The process prints the no-login warning because it is not bound to loopback only.
+Create `cert.pem` and `key.pem` with [mkcert](https://github.com/FiloSottile/mkcert) for your LAN IP, install mkcert’s root on the iPhone (AirDrop `rootCA.pem`, install the profile, then Settings → General → About → Certificate Trust Settings), and open `https://<lan-ip>:8443`. There is no startup warning about a bind address: on Vercel that message would be wrong, because the site is public while `PIXEL_HOST` stays unset. The limit is the same either way. Anyone on the Wi-Fi who opens the page can fetch a link.
 
 A free Cloudflare quick tunnel also works, and it is public:
 
@@ -93,4 +102,4 @@ Play a track, then lock the phone. The Media Session API publishes play, pause, 
 pytest
 ```
 
-The tests cover the fetch endpoint: the file is streamed back with its tags, nothing is left on the server, and YouTube, Spotify, Apple Music, private addresses, bad file signatures, and oversized files are refused. They also check the 4 MB cap, the no-login warning, the web manifest, and the service worker.
+The tests cover the fetch endpoint: the file is streamed back with its tags, nothing is left on the server, and YouTube, Spotify, Apple Music, private addresses, redirects to private addresses, bad file signatures, and oversized files are refused. They also check same-origin, the per-address limit, the 20 second deadline, the 4 MB cap, the web manifest, and the service worker.
