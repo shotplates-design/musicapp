@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1030">
+  <meta name="color-scheme" content="dark">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Pixel Music">
+  <meta name="format-detection" content="telephone=no">
+  <title>Pixel Music</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div>
+        <p class="logo">Pixel Music</p>
+        <p class="tag">link tapes</p>
+      </div>
+      <p class="usage" id="usage">0 B</p>
+    </header>
+    <div class="stage">
+      <p class="notice rights" id="rights">Only add audio you have rights to.</p>
+      <main id="view" class="view"></main>
+    </div>
+    <section class="player" id="player" aria-label="Now playing">
+      <button class="player-open" id="player-open" type="button">
+        <span class="art art-empty" id="player-art"></span>
+        <span class="player-copy">
+          <span class="player-title" id="player-title">No tape loaded</span>
+          <span class="player-artist" id="player-artist">Add a link to start</span>
+        </span>
+      </button>
+      <button class="btn icon-btn" id="player-toggle" type="button" aria-label="Play">Play</button>
+      <div class="transport">
+        <button class="btn ghost" id="player-prev" type="button">Prev</button>
+        <button class="btn ghost" id="player-next" type="button">Next</button>
+      </div>
+      <label class="seek">
+        <span class="visually-hidden">Seek</span>
+        <input id="seek" type="range" min="0" max="1000" value="0" step="1" disabled>
+      </label>
+      <p class="time"><span id="time-now">0:00</span><span id="time-end">0:00</span></p>
+    </section>
+    <nav class="nav" aria-label="Sections">
+      <button class="nav-btn" type="button" data-tab="library" aria-current="page">Lib</button>
+      <button class="nav-btn" type="button" data-tab="add">Add</button>
+    </nav>
+    <div id="sheet" class="sheet" hidden></div>
+    <div id="modal" class="modal" hidden></div>
+    <p id="toast" class="toast" hidden role="status"></p>
+    <audio id="audio" playsinline webkit-playsinline preload="none"></audio>
+  </div>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
