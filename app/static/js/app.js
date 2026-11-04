@@ -78,9 +78,13 @@ function artistKey(name) {
   return normalizeArtist(name).toLowerCase();
 }
 
+function isManualPlaylist(playlist) {
+  return playlist?.kind === "manual";
+}
+
 function findArtistPlaylist(playlists, artist) {
   const key = artistKey(artist);
-  return playlists.find((playlist) => (playlist.artistKey || artistKey(playlist.name)) === key) || null;
+  return playlists.find((playlist) => !isManualPlaylist(playlist) && (playlist.artistKey || artistKey(playlist.name)) === key) || null;
 }
 
 function addSongToArtistPlaylist(playlists, artist, trackId) {
@@ -91,9 +95,10 @@ function addSongToArtistPlaylist(playlists, artist, trackId) {
     if (!ids.includes(trackId)) ids.push(trackId);
     existing.trackIds = ids;
     if (!existing.artistKey) existing.artistKey = artistKey(name);
+    existing.kind = "artist";
     return existing;
   }
-  const created = { id: createId(), name, artistKey: artistKey(name), trackIds: [trackId] };
+  const created = { id: createId(), name, kind: "artist", artistKey: artistKey(name), trackIds: [trackId] };
   playlists.push(created);
   return created;
 }
@@ -106,6 +111,46 @@ function sortPlaylists(playlists) {
     if (aUnknown !== bUnknown) return aUnknown ? 1 : -1;
     return String(a.name).localeCompare(String(b.name), undefined, { sensitivity: "base" });
   });
+}
+
+function cleanPlaylistName(name) {
+  return String(name || "").replace(/\u0000/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function manualNameKey(name) {
+  return cleanPlaylistName(name).toLowerCase();
+}
+
+function manualNameTaken(playlists, name, ignoreId) {
+  const key = manualNameKey(name);
+  if (!key) return false;
+  return playlists.some((playlist) => isManualPlaylist(playlist) && playlist.id !== ignoreId && manualNameKey(playlist.name) === key);
+}
+
+function createManualPlaylist(playlists, name) {
+  const cleaned = cleanPlaylistName(name);
+  if (!cleaned) return { error: "Name the playlist." };
+  if (manualNameTaken(playlists, cleaned)) return { error: "That playlist already exists." };
+  const created = { id: createId(), name: cleaned, kind: "manual", trackIds: [] };
+  playlists.push(created);
+  return { playlist: created };
+}
+
+function renameManualPlaylist(playlists, playlistId, name) {
+  const cleaned = cleanPlaylistName(name);
+  if (!cleaned) return { error: "Name the playlist." };
+  const playlist = playlists.find((item) => item.id === playlistId && isManualPlaylist(item));
+  if (!playlist) return { error: "That playlist is not yours to rename." };
+  if (manualNameTaken(playlists, cleaned, playlistId)) return { error: "That playlist already exists." };
+  playlist.name = cleaned;
+  return { playlist };
+}
+
+function deleteManualPlaylist(playlists, playlistId) {
+  const index = playlists.findIndex((item) => item.id === playlistId && isManualPlaylist(item));
+  if (index < 0) return { error: "That playlist is not yours to delete." };
+  const [playlist] = playlists.splice(index, 1);
+  return { playlist };
 }
 
 function createId() {
@@ -178,17 +223,26 @@ async function refreshStorage() {
 
 function syncArtistPlaylists(tracks, playlists) {
   const live = new Set(tracks.map((track) => track.id));
+  const manual = [];
+  const artist = [];
   for (const playlist of playlists) {
     playlist.trackIds = (playlist.trackIds || []).filter((id) => live.has(id));
+    if (isManualPlaylist(playlist)) {
+      manual.push(playlist);
+      continue;
+    }
+    playlist.kind = "artist";
     if (!playlist.artistKey) playlist.artistKey = artistKey(playlist.name);
+    artist.push(playlist);
   }
-  const assigned = new Set(playlists.flatMap((playlist) => playlist.trackIds));
+  const assigned = new Set(artist.flatMap((playlist) => playlist.trackIds));
   for (const track of tracks) {
     if (assigned.has(track.id)) continue;
-    addSongToArtistPlaylist(playlists, track.artist, track.id);
+    addSongToArtistPlaylist(artist, track.artist, track.id);
     assigned.add(track.id);
   }
-  return sortPlaylists(playlists.filter((playlist) => playlist.trackIds.length));
+  const kept = artist.filter((playlist) => playlist.trackIds.length);
+  return sortPlaylists(manual).concat(sortPlaylists(kept));
 }
 
 async function refresh() {
@@ -562,7 +616,54 @@ function openPlaylist(id) {
   renderView();
 }
 
+function songCountLabel(count) {
+  return count === 1 ? "1 song" : `${count} songs`;
+}
+
+function renderPlaylistCard(playlist) {
+  const songs = playlistTracks(playlist);
+  const count = songs.length;
+  const manual = isManualPlaylist(playlist);
+  view.append(el("article", { class: "card" }, [
+    artNode(songs.find((track) => artUrls.get(track.id)) || null),
+    el("div", { class: "body" }, [
+      el("p", { class: "track-title", text: playlist.name }),
+      el("p", { class: "meta", text: manual ? `Playlist · ${songCountLabel(count)}` : songCountLabel(count) }),
+    ]),
+    el("div", { class: "row-actions" }, [
+      el("button", {
+        class: "btn",
+        type: "button",
+        text: "Open",
+        onclick: () => openPlaylist(playlist.id),
+      }),
+      el("button", {
+        class: "btn",
+        type: "button",
+        text: "Play",
+        disabled: count === 0,
+        onclick: () => { void playIds(songs.map((track) => track.id), 0); },
+      }),
+    ]),
+  ]));
+}
+
 function renderLibrary() {
+  const open = state.playlists.find((playlist) => playlist.id === state.playlistId);
+  if (open) {
+    renderPlaylist(open);
+    return;
+  }
+  const manual = sortPlaylists(state.playlists.filter((playlist) => isManualPlaylist(playlist)));
+  const artist = sortPlaylists(state.playlists.filter((playlist) => !isManualPlaylist(playlist)));
+  view.append(el("div", { class: "section-head" }, [
+    el("h2", { text: "Playlists" }),
+    el("button", { class: "btn", type: "button", text: "New", onclick: openCreatePlaylist }),
+  ]));
+  if (!manual.length) {
+    view.append(el("p", { class: "help", text: "No playlists yet. Name one, then add any song to it." }));
+  }
+  for (const playlist of manual) renderPlaylistCard(playlist);
   if (!state.tracks.length) {
     view.append(el("section", { class: "panel" }, [
       el("h2", { text: "Library" }),
@@ -571,50 +672,28 @@ function renderLibrary() {
     ]));
     return;
   }
-  const open = state.playlists.find((playlist) => playlist.id === state.playlistId);
-  if (open) {
-    renderPlaylist(open);
-    return;
-  }
   view.append(el("h2", { text: "Artists" }));
-  for (const playlist of state.playlists) {
-    const songs = playlistTracks(playlist);
-    const count = songs.length;
-    view.append(el("article", { class: "card" }, [
-      artNode(songs.find((track) => artUrls.get(track.id)) || null),
-      el("div", { class: "body" }, [
-        el("p", { class: "track-title", text: playlist.name }),
-        el("p", { class: "meta", text: count === 1 ? "1 song" : `${count} songs` }),
-      ]),
-      el("div", { class: "row-actions" }, [
-        el("button", {
-          class: "btn",
-          type: "button",
-          text: "Open",
-          onclick: () => openPlaylist(playlist.id),
-        }),
-        el("button", {
-          class: "btn",
-          type: "button",
-          text: "Play",
-          onclick: () => { void playIds(songs.map((track) => track.id), 0); },
-        }),
-      ]),
-    ]));
-  }
+  for (const playlist of artist) renderPlaylistCard(playlist);
 }
 
 function renderPlaylist(playlist) {
   const songs = playlistTracks(playlist);
+  const manual = isManualPlaylist(playlist);
   view.append(el("div", { class: "inline" }, [
     el("button", {
       class: "btn ghost",
       type: "button",
-      text: "Artists",
+      text: "Library",
       onclick: () => { state.playlistId = null; renderView(); },
     }),
+    manual ? el("button", { class: "btn", type: "button", text: "Rename", onclick: () => openRenamePlaylist(playlist) }) : null,
+    manual ? el("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => confirmDeletePlaylist(playlist) }) : null,
   ]));
   view.append(el("h2", { text: playlist.name }));
+  view.append(el("p", { class: "help", text: manual ? "Your playlist" : "Artist playlist" }));
+  if (!songs.length) {
+    view.append(el("p", { class: "help", text: "No songs in this playlist yet." }));
+  }
   for (const track of songs) {
     const playing = state.currentId === track.id && !audio.paused;
     view.append(el("article", { class: "card" }, [
@@ -637,10 +716,17 @@ function renderPlaylist(playlist) {
               audio.paused ? audio.play().catch(() => toast("Tap Play to start.")) : audio.pause();
               return;
             }
-            const songs = playlistTracks(playlist);
-            void playIds(songs.map((item) => item.id), songs.indexOf(track));
+            const queued = playlistTracks(playlist);
+            void playIds(queued.map((item) => item.id), queued.indexOf(track));
           },
         }),
+        el("button", { class: "btn", type: "button", text: "Add", onclick: () => openAddToPlaylists(track) }),
+        manual ? el("button", {
+          class: "btn ghost",
+          type: "button",
+          text: "Remove",
+          onclick: () => { void removeSongFromPlaylist(playlist, track.id); },
+        }) : null,
         el("button", { class: "btn danger", type: "button", text: "Del", onclick: () => confirmDelete(track) }),
       ]),
     ]));
@@ -681,6 +767,11 @@ function renderAdd() {
   ]));
 }
 
+function closeModal() {
+  state.modal = null;
+  renderModal();
+}
+
 function renderModal() {
   const root = document.querySelector("#modal");
   if (!state.modal) {
@@ -689,25 +780,163 @@ function renderModal() {
     return;
   }
   const modal = state.modal;
-  root.hidden = false;
-  root.replaceChildren(el("div", { class: "modal-card", role: "dialog", "aria-modal": "true" }, [
-    el("h2", { text: modal.title }),
-    el("p", { class: "help", text: modal.body }),
-    el("div", { class: "inline" }, [
-      el("button", { class: "btn ghost", type: "button", text: "Cancel", onclick: () => { state.modal = null; renderModal(); } }),
-      el("button", {
-        class: "btn danger",
-        type: "button",
-        text: modal.confirmLabel,
-        onclick: () => {
-          const run = modal.onConfirm;
-          state.modal = null;
-          renderModal();
-          run();
+  const children = [el("h2", { text: modal.title })];
+  if (modal.body) children.push(el("p", { class: "help", text: modal.body }));
+  if (modal.nameInput) {
+    children.push(el("label", { class: "field" }, [
+      el("span", { text: "Name" }),
+      el("input", {
+        id: "playlist-name",
+        type: "text",
+        maxlength: "80",
+        value: modal.draftName || "",
+        autocomplete: "off",
+        oninput: (event) => { modal.draftName = event.target.value; },
+        onkeydown: (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            modal.onConfirm();
+          }
         },
       }),
-    ]),
+    ]));
+  }
+  if (modal.checks) {
+    children.push(el("div", { class: "checks" }, modal.checks.map((check) => el("label", { class: "check" }, [
+      el("input", {
+        type: "checkbox",
+        checked: check.checked,
+        onchange: (event) => { check.checked = event.target.checked; },
+      }),
+      el("span", { text: check.label }),
+    ]))));
+  }
+  children.push(el("div", { class: "inline" }, [
+    el("button", { class: "btn ghost", type: "button", text: "Cancel", onclick: closeModal }),
+    el("button", {
+      class: modal.confirmClass || "btn danger",
+      type: "button",
+      text: modal.confirmLabel,
+      onclick: () => modal.onConfirm(),
+    }),
   ]));
+  root.hidden = false;
+  root.replaceChildren(el("div", { class: "modal-card", role: "dialog", "aria-modal": "true" }, children));
+  const field = root.querySelector("#playlist-name");
+  if (field) field.focus();
+}
+
+async function persistPlaylists() {
+  try {
+    await replacePlaylists(state.playlists);
+  } catch {
+    toast("Couldn't save that playlist.");
+    return false;
+  }
+  renderView();
+  return true;
+}
+
+function openCreatePlaylist() {
+  state.modal = {
+    title: "New playlist",
+    body: "Names match without case, so Road Trip and road trip are the same playlist.",
+    nameInput: true,
+    draftName: "",
+    confirmLabel: "Create",
+    confirmClass: "btn pink",
+    onConfirm: () => { void submitPlaylistName("create"); },
+  };
+  renderModal();
+}
+
+function openRenamePlaylist(playlist) {
+  state.modal = {
+    title: "Rename playlist",
+    nameInput: true,
+    draftName: playlist.name,
+    playlistId: playlist.id,
+    confirmLabel: "Rename",
+    confirmClass: "btn pink",
+    onConfirm: () => { void submitPlaylistName("rename"); },
+  };
+  renderModal();
+}
+
+async function submitPlaylistName(mode) {
+  const modal = state.modal;
+  if (!modal) return;
+  const result = mode === "rename"
+    ? renameManualPlaylist(state.playlists, modal.playlistId, modal.draftName)
+    : createManualPlaylist(state.playlists, modal.draftName);
+  if (result.error) {
+    toast(result.error);
+    return;
+  }
+  if (mode === "create") state.playlistId = result.playlist.id;
+  closeModal();
+  if (await persistPlaylists()) toast(mode === "create" ? "Playlist created." : "Playlist renamed.");
+}
+
+function confirmDeletePlaylist(playlist) {
+  state.modal = {
+    title: "Delete playlist",
+    body: `Delete “${playlist.name}”? Songs stay in your library.`,
+    confirmLabel: "Delete",
+    onConfirm: () => { void removeManualPlaylist(playlist.id); },
+  };
+  renderModal();
+}
+
+async function removeManualPlaylist(id) {
+  const result = deleteManualPlaylist(state.playlists, id);
+  if (result.error) {
+    toast(result.error);
+    return;
+  }
+  if (state.playlistId === id) state.playlistId = null;
+  closeModal();
+  if (await persistPlaylists()) toast("Playlist deleted.");
+}
+
+function openAddToPlaylists(track) {
+  const manuals = sortPlaylists(state.playlists.filter((playlist) => isManualPlaylist(playlist)));
+  if (!manuals.length) {
+    toast("Create a playlist first.");
+    return;
+  }
+  const checks = manuals.map((playlist) => ({
+    id: playlist.id,
+    label: playlist.name,
+    checked: (playlist.trackIds || []).includes(track.id),
+  }));
+  state.modal = {
+    title: "Add to playlists",
+    body: track.title,
+    checks,
+    confirmLabel: "Save",
+    confirmClass: "btn pink",
+    onConfirm: () => { void applySongPlaylists(track.id, checks); },
+  };
+  renderModal();
+}
+
+async function applySongPlaylists(trackId, checks) {
+  for (const check of checks) {
+    const playlist = state.playlists.find((item) => item.id === check.id && isManualPlaylist(item));
+    if (!playlist) continue;
+    const ids = (playlist.trackIds || []).filter((id) => id !== trackId);
+    if (check.checked) ids.push(trackId);
+    playlist.trackIds = ids;
+  }
+  closeModal();
+  if (await persistPlaylists()) toast("Playlists updated.");
+}
+
+async function removeSongFromPlaylist(playlist, trackId) {
+  if (!isManualPlaylist(playlist)) return;
+  playlist.trackIds = (playlist.trackIds || []).filter((id) => id !== trackId);
+  if (await persistPlaylists()) toast("Removed from playlist.");
 }
 
 function confirmDelete(track) {
@@ -715,7 +944,10 @@ function confirmDelete(track) {
     title: "Delete track",
     body: `Remove “${track.title}” and its audio from this phone?`,
     confirmLabel: "Delete",
-    onConfirm: () => { void deleteTrack(track.id); },
+    onConfirm: () => {
+      closeModal();
+      void deleteTrack(track.id);
+    },
   };
   renderModal();
 }

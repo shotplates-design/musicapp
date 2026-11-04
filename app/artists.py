@@ -82,10 +82,20 @@ def detect_artist(
     return UNKNOWN_ARTIST
 
 
+def _is_manual(playlist: dict) -> bool:
+    return playlist.get("kind") == "manual"
+
+
 def find_artist_playlist(playlists: list[dict], artist: str) -> dict | None:
-    """Return the playlist whose normalized name matches artist, if any."""
+    """Return the artist playlist whose normalized name matches, if any.
+
+    User-named playlists are skipped so a manual playlist can share an
+    artist's name without collecting that artist's new songs.
+    """
     key = artist_key(artist)
     for playlist in playlists:
+        if _is_manual(playlist):
+            continue
         stored = playlist.get("artistKey") or artist_key(playlist.get("name") or "")
         if stored == key:
             return playlist
@@ -102,10 +112,12 @@ def add_song_to_artist_playlist(playlists: list[dict], artist: str, track_id: st
             ids.append(str(track_id))
         existing["trackIds"] = ids
         existing["artistKey"] = existing.get("artistKey") or artist_key(name)
+        existing["kind"] = "artist"
         return existing
     created = {
         "id": str(uuid.uuid4()),
         "name": name,
+        "kind": "artist",
         "artistKey": artist_key(name),
         "trackIds": [str(track_id)],
     }
