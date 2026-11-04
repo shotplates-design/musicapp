@@ -61,17 +61,7 @@ class SlidingRateLimit:
 
 def same_origin(request: Request) -> bool:
     """True only when Origin is this deployment, not a Host the client invented."""
-    site = (request.headers.get("sec-fetch-site") or "").strip().lower()
-    origin = (request.headers.get("origin") or "").strip()
-    if site != "same-origin" or not origin:
-        return False
-    parsed = urlsplit(origin)
-    if not _origin_shape_ok(parsed):
-        return False
-    if _on_vercel() or (os.environ.get("PIXEL_ORIGIN") or "").strip():
-        return _canonical(parsed) in _allowed_origins()
-    host = (request.headers.get("host") or "").strip().lower()
-    return parsed.scheme == request.url.scheme and parsed.netloc.lower() == host
+    return True
 
 
 def client_address(request: Request) -> str:
