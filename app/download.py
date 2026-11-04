@@ -3,6 +3,10 @@
 This module fetches one http(s) URL that already points at an audio file.
 It does not talk to YouTube, Spotify, Apple Music, or any other streaming
 service, and it does not extract audio from web pages.
+
+The hostname is resolved once. The TCP connection uses that validated address
+so a later DNS answer cannot redirect the download. The Host header and the
+TLS SNI / certificate name stay the original hostname.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlsplit, urlunsplit, urljoin
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -46,7 +50,12 @@ ALLOWED_TYPES = {
 }
 
 REDIRECTS = {301, 302, 303, 307, 308}
-_NUMERIC_HOST = re.compile(r"\d+(?:\.\d+){0,3}")
+# Decimal, octal (leading 0), or hex (0x) parts, 1 to 4 of them. Catches
+# 2130706433, 0177.0.0.1, 0x7f.1, and 127.1 before they reach a resolver.
+_OBFUSCATED_IPV4 = re.compile(
+    r"(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+)){0,3}\Z",
+    re.IGNORECASE,
+)
 
 
 class LinkError(Exception):
@@ -85,11 +94,7 @@ def normalize_audio_url(url: str) -> str:
         )
     if _is_local_name(host):
         raise LinkError("That address isn't allowed.")
-    ip = _ip_literal(host)
-    if ip is not None and not ip.is_global:
-        raise LinkError("That address isn't allowed.")
-    if ip is None and _NUMERIC_HOST.fullmatch(host):
-        raise LinkError("That address isn't allowed.")
+    _public_literal(host)
     if parts.port is not None and not 1 <= parts.port <= 65535:
         raise LinkError("That link isn't a direct audio file.")
     extension = _extension(parts.path)
@@ -97,7 +102,8 @@ def normalize_audio_url(url: str) -> str:
         raise LinkError(
             "That link isn't a direct audio file. Use an MP3, M4A, AAC, OGG, Opus, WAV, or FLAC URL."
         )
-    return urlunsplit((scheme, _netloc(host, parts.port), parts.path or "/", parts.query, ""))
+    ascii_host = _ascii_host(host)
+    return urlunsplit((scheme, _netloc(ascii_host, parts.port), parts.path or "/", parts.query, ""))
 
 
 def default_resolver(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
@@ -114,12 +120,47 @@ def default_resolver(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Ad
     return found
 
 
-def ensure_public_dns(host: str, resolver) -> None:
-    """Reject hosts that resolve to loopback, private, or link-local addresses."""
-    literal = _ip_literal(host)
-    addresses = [literal] if literal is not None else list(resolver(host))
-    if not addresses or any(not address.is_global for address in addresses):
+def resolve_public(host: str, resolver) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Return global addresses for host. A literal is not resolved again.
+
+    Every address from one lookup must be global. A name that answers with
+    both a public and a private address is rejected.
+    """
+    literal = _public_literal(host)
+    if literal is not None:
+        return [literal]
+    try:
+        addresses = list(resolver(host))
+    except LinkError:
+        raise
+    except OSError as exc:
+        raise LinkError("Could not find that host.") from exc
+    checked = []
+    for address in addresses:
+        address = _unmap(address)
+        if not address.is_global:
+            raise LinkError("That address isn't allowed.")
+        checked.append(address)
+    if not checked:
         raise LinkError("That address isn't allowed.")
+    return checked
+
+
+def signature_matches(header: bytes, extension: str) -> bool:
+    """True when the leading bytes are the file type the URL extension names."""
+    if extension == "mp3":
+        return header.startswith(b"ID3") or _mpeg_frame(header)
+    if extension == "m4a":
+        return len(header) >= 8 and header[4:8] == b"ftyp"
+    if extension in {"ogg", "opus"}:
+        return header.startswith(b"OggS")
+    if extension == "flac":
+        return header.startswith(b"fLaC")
+    if extension == "wav":
+        return len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE"
+    if extension == "aac":
+        return _adts(header)
+    return False
 
 
 async def download_audio(
@@ -142,16 +183,20 @@ async def download_audio(
     ) as client:
         for _ in range(MAX_REDIRECTS + 1):
             parts = urlsplit(current)
-            ensure_public_dns(parts.hostname or "", resolver)
+            host = parts.hostname or ""
+            addresses = resolve_public(host, resolver)
             extension = _extension(parts.path)
+            pinned = _pinned_url(parts, addresses[0])
             async with client.stream(
                 "GET",
-                current,
+                pinned,
                 headers={
+                    "Host": _host_header(host, parts.port, parts.scheme),
                     "User-Agent": USER_AGENT,
                     "Accept": "audio/*",
                     "Accept-Encoding": "identity",
                 },
+                extensions={"sni_hostname": host},
             ) as response:
                 if response.status_code in REDIRECTS:
                     location = response.headers.get("location")
@@ -181,6 +226,11 @@ async def download_audio(
                 if written <= 0:
                     dest.unlink(missing_ok=True)
                     raise LinkError("That file was empty. Nothing was saved.")
+                with dest.open("rb") as handle:
+                    header = handle.read(64)
+                if not signature_matches(header, extension):
+                    dest.unlink(missing_ok=True)
+                    raise LinkError("That file doesn't match its audio type. Nothing was saved.")
                 filename = _filename_from_path(parts.path, extension)
                 return DownloadedAudio(mime_type=mime, filename=filename, extension=extension)
     raise LinkError("Too many redirects. Nothing was saved.")
@@ -223,11 +273,110 @@ def _netloc(host: str, port: int | None) -> str:
     return formatted
 
 
+def _pinned_url(parts, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    host = f"[{ip}]" if ip.version == 6 else str(ip)
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme, netloc, parts.path or "/", parts.query, ""))
+
+
+def _host_header(host: str, port: int | None, scheme: str) -> str:
+    formatted = f"[{host}]" if ":" in host else host
+    default = 443 if scheme == "https" else 80
+    if port and port != default:
+        return f"{formatted}:{port}"
+    return formatted
+
+
 def _ip_literal(host: str):
     try:
         return ipaddress.ip_address(host)
     except ValueError:
         return None
+
+
+def _unmap(ip: ipaddress.IPv4Address | ipaddress.IPv6Address):
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _public_literal(host: str):
+    """Return a global IP literal, raise if it is not public, or None for a name."""
+    ip = _ip_literal(host)
+    if ip is None:
+        ip = _parse_obfuscated_ipv4(host)
+    if ip is None:
+        return None
+    ip = _unmap(ip)
+    if not ip.is_global:
+        raise LinkError("That address isn't allowed.")
+    return ip
+
+
+def _parse_obfuscated_ipv4(host: str):
+    if not _OBFUSCATED_IPV4.fullmatch(host):
+        return None
+    values = []
+    for part in host.split("."):
+        try:
+            if part.lower().startswith("0x"):
+                values.append(int(part, 16))
+            elif len(part) > 1 and part.startswith("0") and all(ch in "01234567" for ch in part):
+                values.append(int(part, 8))
+            else:
+                values.append(int(part, 10))
+        except ValueError as exc:
+            raise LinkError("That address isn't allowed.") from exc
+    try:
+        return ipaddress.IPv4Address(_inet_aton(values))
+    except (ValueError, ipaddress.AddressValueError) as exc:
+        raise LinkError("That address isn't allowed.") from exc
+
+
+def _inet_aton(parts: list[int]) -> int:
+    """Pack 1–4 numeric parts the way inet_aton does (127.1 -> 127.0.0.1)."""
+    if len(parts) == 1:
+        limits = (0xFFFFFFFF,)
+    elif len(parts) == 2:
+        limits = (0xFF, 0xFFFFFF)
+    elif len(parts) == 3:
+        limits = (0xFF, 0xFF, 0xFFFF)
+    elif len(parts) == 4:
+        limits = (0xFF, 0xFF, 0xFF, 0xFF)
+    else:
+        raise ValueError("not an IPv4 literal")
+    for value, limit in zip(parts, limits):
+        if value < 0 or value > limit:
+            raise ValueError("part out of range")
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return (parts[0] << 24) | parts[1]
+    if len(parts) == 3:
+        return (parts[0] << 24) | (parts[1] << 16) | parts[2]
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+
+
+def _mpeg_frame(header: bytes) -> bool:
+    if len(header) < 2 or header[0] != 0xFF or (header[1] & 0xE0) != 0xE0:
+        return False
+    version = (header[1] >> 3) & 0x03
+    layer = (header[1] >> 1) & 0x03
+    return version != 0x01 and layer != 0x00
+
+
+def _adts(header: bytes) -> bool:
+    if len(header) < 2 or header[0] != 0xFF:
+        return False
+    # 12-bit sync, layer bits must be 00. ID and protection bits may vary.
+    return (header[1] & 0xF6) == 0xF0
+
+
+def _ascii_host(host: str) -> str:
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise LinkError("That address isn't allowed.") from exc
 
 
 def _is_local_name(host: str) -> bool:

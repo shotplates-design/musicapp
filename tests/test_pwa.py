@@ -51,6 +51,8 @@ def test_ios_shell(tmp_path):
     script = client.get("/js/app.js")
     assert script.status_code == 200
     assert "mediaSession" in script.text
+    assert "Authorization" in script.text
+    assert "pixel_token" in script.text
     assert "setActionHandler" in script.text
     font = client.get("/fonts/PressStart2P-Regular.woff2")
     assert font.status_code == 200

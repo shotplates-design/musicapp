@@ -18,21 +18,23 @@ Each record follows the pixel-music track shape: `title`, `artist`, `duration`, 
 
 Title and artist come from ID3 (`TIT2` / `TPE1`), MP4 (`©nam` / `©ART`), or Vorbis/FLAC comments. If those are missing, the title is the file name and the artist is “Unknown artist”. Cover art is the ID3 `APIC`, MP4 `covr`, or FLAC picture.
 
-Accepted direct links: `.mp3`, `.m4a`, `.aac`, `.ogg`, `.opus`, `.wav`, `.flac`. The response `Content-Type` must be an audio type that matches the extension. Files over 80 MB are refused (`PIXEL_MAX_BYTES` changes the cap). Private, loopback, and link-local addresses are refused.
+Accepted direct links: `.mp3`, `.m4a`, `.aac`, `.ogg`, `.opus`, `.wav`, `.flac`. The response `Content-Type` must be an audio type that matches the extension, and the file’s leading bytes must match that type (ID3 or an MP3 frame, M4A `ftyp`, Ogg, FLAC, WAV `RIFF`/`WAVE`, or AAC ADTS). Files over 80 MB are refused (`PIXEL_MAX_BYTES` changes the cap). The size is the number of bytes actually downloaded, whether or not `Content-Length` is missing or wrong. Private, loopback, link-local, and alternate spellings of those addresses (hex, octal, IPv4-mapped IPv6) are refused. The hostname is resolved once and the connection uses that address.
 
 ## Run it on your computer
+
+The server listens on `127.0.0.1` only. That is this computer, not the rest of the network, and it does not need a token.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 pytest
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+python -m app
 ```
 
 Open `http://127.0.0.1:8000`. Paste a link on **Add**, then play it from **Lib**. The bottom bar seeks, pauses, and moves to the next or previous track. Tap the bar for a larger player.
 
-There is no account and no API key. Nothing in this repo is a secret. `cert.pem` and `key.pem` are gitignored if you create them for HTTPS below.
+`PIXEL_PORT` changes the port (the default is 8000). Nothing in this repo is a secret. Do not commit `.env`. `cert.pem` and `key.pem` are gitignored if you create them for HTTPS below.
 
 ## Use it on an iPhone
 
@@ -56,16 +58,21 @@ chmod +x cloudflared
 sudo mv cloudflared /usr/local/bin/
 ```
 
-Start the app, then the tunnel:
+The tunnel is a public URL, so the API requires a token even though the app still listens on `127.0.0.1`. Pick a token and keep it out of the shell history you share and out of git:
 
 ```bash
-uvicorn app.main:app --host 127.0.0.1 --port 8000
+export PIXEL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+python -m app
 cloudflared tunnel --url http://127.0.0.1:8000
 ```
 
-cloudflared prints an `https://….trycloudflare.com` URL. Open **that** URL in Safari on the iPhone.
+cloudflared prints an `https://….trycloudflare.com` URL. On the iPhone, open that URL in Safari with the token in the fragment, which the page stores and then removes from the address bar:
 
-The tunnel is public. Anyone with the URL can open your player and add links. Do not share it, and stop cloudflared when you are done (`Ctrl-C`). For a server that stays on your Wi-Fi only, use mkcert instead.
+```text
+https://….trycloudflare.com/#token=THE_TOKEN_YOU_EXPORTED
+```
+
+Wait until the library loads, then add the site to the Home Screen (the next section). The home-screen icon opens the same origin, and the saved token is sent on library and playback requests. Do not share the tunnel URL or the token. Stop cloudflared when you are done (`Ctrl-C`). For a server that stays on your Wi-Fi only, use mkcert instead.
 
 ### 2. mkcert on the same Wi-Fi (stays private)
 
@@ -84,9 +91,15 @@ Find the computer’s LAN address (`ipconfig getifaddr en0` on macOS, `hostname 
 
 ```bash
 mkcert -cert-file cert.pem -key-file key.pem localhost 127.0.0.1 192.168.1.20
-uvicorn app.main:app --host 0.0.0.0 --port 8443 \
-  --ssl-keyfile key.pem --ssl-certfile cert.pem
+export PIXEL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+export PIXEL_HOST=0.0.0.0
+export PIXEL_PORT=8443
+export PIXEL_SSL_CERTFILE=cert.pem
+export PIXEL_SSL_KEYFILE=key.pem
+python -m app
 ```
+
+`PIXEL_HOST` is `0.0.0.0` here so the phone can connect. The process refuses to start that way unless `PIXEL_TOKEN` is set. The token is required on every library and audio request.
 
 Trust the mkcert root on the iPhone, or Safari will warn and the service worker will not install:
 
@@ -95,13 +108,17 @@ Trust the mkcert root on the iPhone, or Safari will warn and the service worker 
 3. Install the profile: Settings → Profile Downloaded → Install.
 4. Settings → General → About → Certificate Trust Settings → enable full trust for the mkcert root.
 
-Then, on the same Wi-Fi, open `https://192.168.1.20:8443` in Safari. The lock icon should be clean.
+Then, on the same Wi-Fi, open this address in Safari (use your token and your LAN IP). The lock icon should be clean.
 
-A self-signed OpenSSL certificate works the same way if you would rather not install mkcert. Create one with a `subjectAltName` for your LAN IP, install that certificate as a trusted root on the iPhone, and pass it to uvicorn with `--ssl-certfile` and `--ssl-keyfile`. mkcert is the less fiddly of the two.
+```text
+https://192.168.1.20:8443/#token=THE_TOKEN_YOU_EXPORTED
+```
+
+A self-signed OpenSSL certificate works the same way if you would rather not install mkcert. Create one with a `subjectAltName` for your LAN IP, install that certificate as a trusted root on the iPhone, and point `PIXEL_SSL_CERTFILE` and `PIXEL_SSL_KEYFILE` at it before `python -m app`. mkcert is the less fiddly of the two.
 
 ### 3. Add to Home Screen
 
-1. In **Safari**, open the HTTPS URL from the tunnel or from mkcert.
+1. In **Safari**, open the HTTPS URL from the tunnel or from mkcert, including `#token=…`. Wait until the library loads. The page stores the token and drops it from the address.
 2. Tap the **Share** button (the square with the arrow).
 3. Scroll the sheet and tap **Add to Home Screen**.
 4. Leave the name as **Pixel Music**. The icon is the pixel note. Tap **Add**.

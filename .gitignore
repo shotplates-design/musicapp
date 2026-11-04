@@ -7,3 +7,6 @@ cert.pem
 key.pem
 *.pem
 .DS_Store
+.env
+.env.*
+!.env.example

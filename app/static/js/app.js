@@ -1,6 +1,39 @@
 const audio = document.querySelector("#audio");
 const view = document.querySelector("#view");
 const seek = document.querySelector("#seek");
+const TOKEN_KEY = "pixel-music-token";
+
+function loadToken() {
+  let stored = "";
+  try { stored = localStorage.getItem(TOKEN_KEY) || ""; } catch { stored = ""; }
+  const hash = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : "");
+  const fromHash = hash.get("token");
+  if (fromHash) {
+    stored = fromHash;
+    try { localStorage.setItem(TOKEN_KEY, stored); } catch { /* private mode */ }
+    hash.delete("token");
+    const rest = hash.toString();
+    history.replaceState(null, "", location.pathname + location.search + (rest ? `#${rest}` : ""));
+  }
+  if (stored) {
+    document.cookie = `pixel_token=${encodeURIComponent(stored)}; Path=/; SameSite=Strict`;
+  }
+  return stored;
+}
+
+const authToken = loadToken();
+
+function authHeaders(extra = {}) {
+  const headers = { ...extra };
+  if (authToken) headers.Authorization = `Bearer ${authToken}`;
+  return headers;
+}
+
+function withToken(url) {
+  const next = new URL(url, document.baseURI);
+  if (authToken) next.searchParams.set("token", authToken);
+  return next.href;
+}
 
 const state = {
   tab: "library",
@@ -80,7 +113,7 @@ function artNode(track, large = false) {
   if (!track || !track.artworkSize) return el("span", { class: `${classes} art-empty` });
   return el("img", {
     class: classes,
-    src: `api/tracks/${track.id}/artwork`,
+    src: withToken(`api/tracks/${track.id}/artwork`),
     alt: "",
   });
 }
@@ -101,7 +134,11 @@ function previousAction(index, length, currentTime, threshold = 3) {
 }
 
 async function refresh() {
-  const response = await fetch("api/tracks", { cache: "no-store" });
+  const response = await fetch("api/tracks", { cache: "no-store", headers: authHeaders() });
+  if (response.status === 401) {
+    toast("This server needs an access token. Open the address with #token=… once, then add it to the Home Screen.");
+    throw new Error("unauthorized");
+  }
   if (!response.ok) throw new Error("library");
   const body = await response.json();
   state.tracks = body.tracks || [];
@@ -130,7 +167,7 @@ async function addLink(event) {
   try {
     response = await fetch("api/tracks", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ url }),
     });
   } catch {
@@ -171,7 +208,7 @@ async function loadCurrent(autoplay) {
   const track = trackById(id);
   if (!track) return;
   state.currentId = id;
-  const nextSrc = new URL(`api/tracks/${id}/audio`, document.baseURI).href;
+  const nextSrc = withToken(`api/tracks/${id}/audio`);
   if (audio.src !== nextSrc) {
     audio.src = nextSrc;
     audio.load();
@@ -238,7 +275,7 @@ function publishSession(track) {
   const artwork = [];
   if (track.artworkSize > 0) {
     artwork.push({
-      src: new URL(`api/tracks/${track.id}/artwork`, document.baseURI).href,
+      src: withToken(`api/tracks/${track.id}/artwork`),
       sizes: "512x512",
       type: track.artworkMime || "image/jpeg",
     });
@@ -520,7 +557,7 @@ function confirmDelete(track) {
 
 async function deleteTrack(id) {
   try {
-    const response = await fetch(`api/tracks/${id}`, { method: "DELETE" });
+    const response = await fetch(`api/tracks/${id}`, { method: "DELETE", headers: authHeaders() });
     if (!response.ok) {
       toast("Couldn't delete that track.");
       return;
@@ -618,6 +655,7 @@ bindChrome();
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("./sw.js").catch(() => {});
 }
-refresh().catch(() => {
+refresh().catch((error) => {
+  if (error && error.message === "unauthorized") return;
   view.textContent = "Couldn't open the library.";
 });

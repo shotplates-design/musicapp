@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import secrets
 import uuid
 from pathlib import Path
+from urllib.parse import unquote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -16,10 +19,21 @@ from app.library import Library, TrackNotFound, title_from_filename, total_bytes
 from app.tags import read_tags
 
 STATIC = Path(__file__).resolve().parent / "static"
+_UNSET = object()
 
 
 class LinkIn(BaseModel):
     url: str
+
+
+def is_loopback_bind(host: str) -> bool:
+    value = str(host or "").strip().strip("[]").lower()
+    if value in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 def create_app(
@@ -28,14 +42,38 @@ def create_app(
     resolver=None,
     transport=None,
     max_bytes: int | None = None,
+    bind_host: str | None = None,
+    token: str | None | object = _UNSET,
 ) -> FastAPI:
     root = Path(library_dir) if library_dir is not None else Path(os.environ.get("PIXEL_LIBRARY", "library"))
     library = Library(root)
+    if bind_host is None:
+        bind_host = os.environ.get("PIXEL_HOST", "127.0.0.1")
+    if token is _UNSET:
+        token = os.environ.get("PIXEL_TOKEN") or None
+    if isinstance(token, str):
+        token = token.strip() or None
+    exposed = not is_loopback_bind(bind_host)
+    if exposed and not token:
+        raise RuntimeError(
+            "Set PIXEL_TOKEN before listening beyond localhost. Refusing to start without it."
+        )
+    token_required = exposed or bool(token)
     app = FastAPI(title="Pixel Music", docs_url=None, redoc_url=None)
     app.state.library = library
     app.state.resolver = resolver
     app.state.transport = transport
+    app.state.bind_host = bind_host
+    app.state.token = token
+    app.state.token_required = token_required
     app.state.max_bytes = int(os.environ.get("PIXEL_MAX_BYTES", DEFAULT_MAX_BYTES) if max_bytes is None else max_bytes)
+
+    @app.middleware("http")
+    async def require_token(request: Request, call_next):
+        if token_required and request.url.path.startswith("/api/"):
+            if not _token_ok(request, str(token or "")):
+                return JSONResponse({"detail": "Missing or invalid token."}, status_code=401)
+        return await call_next(request)
 
     @app.exception_handler(LinkError)
     async def link_error(_request, exc: LinkError):
@@ -143,6 +181,21 @@ def _resolver():
     from app.download import default_resolver
 
     return default_resolver
+
+
+def _token_ok(request: Request, expected: str) -> bool:
+    presented = ""
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        presented = authorization[7:].strip()
+    if not presented:
+        cookie = request.cookies.get("pixel_token", "")
+        presented = unquote(cookie) if cookie else ""
+    if not presented:
+        presented = request.query_params.get("token", "")
+    if not presented or not expected or len(presented) != len(expected):
+        return False
+    return secrets.compare_digest(presented, expected)
 
 
 def _track_or_404(library: Library, track_id: str) -> dict:
