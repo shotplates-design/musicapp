@@ -291,6 +291,39 @@ def test_forged_host_is_rejected_on_vercel(tmp_path, monkeypatch):
     )
     assert insecure.status_code == 403
 
+    monkeypatch.setenv("VERCEL_BRANCH_URL", "pixel-git-feature-team.vercel.app")
+    branch = client.post(
+        "/api/fetch",
+        json={"url": "https://cdn.example.com/song.wav"},
+        headers={"Origin": "https://pixel-git-feature-team.vercel.app", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert branch.status_code == 200, branch.text
+
+
+def test_pixel_origin_is_the_allowlist_off_vercel(tmp_path, monkeypatch):
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.setenv("PIXEL_ORIGIN", "https://tapes.example")
+    wav = make_wav()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
+
+    client, _application = client_for(tmp_path, handler)
+    forged = client.post(
+        "/api/fetch",
+        json={"url": "https://cdn.example.com/song.wav"},
+        headers={"Host": "evil.example", "Origin": "https://evil.example", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert forged.status_code == 403
+    local = client.post("/api/fetch", json={"url": "https://cdn.example.com/song.wav"})
+    assert local.status_code == 403
+    allowed = client.post(
+        "/api/fetch",
+        json={"url": "https://cdn.example.com/song.wav"},
+        headers={"Origin": "https://tapes.example", "Sec-Fetch-Site": "same-origin"},
+    )
+    assert allowed.status_code == 200, allowed.text
+
 
 def test_spoofed_ip_is_ignored_unless_on_vercel(tmp_path, monkeypatch):
     monkeypatch.delenv("VERCEL", raising=False)
@@ -320,14 +353,56 @@ def test_spoofed_ip_is_ignored_unless_on_vercel(tmp_path, monkeypatch):
     assert other.status_code == 200, other.text
 
 
-def test_rate_limit_drops_stale_keys_and_caps_the_map():
+def test_rate_limit_drops_stale_keys_and_rejects_new_keys_when_full():
     limiter = SlidingRateLimit(limit=10, window_seconds=10, max_keys=2)
     assert limiter.allow("a", now=0)
     assert limiter.allow("b", now=0)
-    assert limiter.allow("c", now=1)
-    assert set(limiter._hits) == {"b", "c"}
+    assert limiter.allow("c", now=1) is False
+    assert set(limiter._hits) == {"a", "b"}
     assert limiter.allow("d", now=100)
     assert set(limiter._hits) == {"d"}
+
+
+def test_blocked_key_stays_blocked_under_a_flood_of_new_keys():
+    limiter = SlidingRateLimit(limit=2, window_seconds=60)
+    assert limiter.allow("blocked", now=0)
+    assert limiter.allow("blocked", now=1)
+    assert limiter.allow("blocked", now=2) is False
+    for index in range(1100):
+        limiter.allow(f"fresh-{index}", now=3)
+    assert "blocked" in limiter._hits
+    assert len(limiter._hits["blocked"]) >= limiter.limit
+    assert len(limiter._hits) <= limiter.max_keys
+    assert limiter.allow("blocked", now=4) is False
+
+
+def test_ipv6_clients_in_one_prefix_share_a_bucket(tmp_path, monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("VERCEL_URL", "pixel.vercel.app")
+    wav = make_wav()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=wav)
+
+    client, _application = client_for(tmp_path, handler)
+
+    def fetch(address: str):
+        return client.post(
+            "/api/fetch",
+            json={"url": "https://cdn.example.com/song.wav"},
+            headers={
+                "Origin": "https://pixel.vercel.app",
+                "Sec-Fetch-Site": "same-origin",
+                "X-Real-IP": address,
+            },
+        )
+
+    for _ in range(10):
+        assert fetch("2001:db8:1:2::1").status_code == 200
+    same_prefix = fetch("2001:db8:1:2:abcd::9")
+    assert same_prefix.status_code == 429
+    other_prefix = fetch("2001:db8:1:3::1")
+    assert other_prefix.status_code == 200, other_prefix.text
 
 
 def test_fetch_deadline_stops_a_slow_download(tmp_path, monkeypatch):

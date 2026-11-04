@@ -56,9 +56,9 @@ No environment variables and no Blob store. The Hobby plan is enough.
 
 `vercel.json` allows the function 60 seconds, inside the Hobby maximum of 300 seconds. Each download also stops after 20 seconds.
 
-`/api/fetch` accepts a browser call only when `Origin` is this deployment. On Vercel that list is `https://` plus `VERCEL_URL` and `VERCEL_PROJECT_PRODUCTION_URL` (both set by the platform). A custom domain needs `PIXEL_ORIGIN` set to that `https://` origin. Localhost and other non-Vercel hosts still compare `Origin` to the request `Host`.
+`/api/fetch` accepts a browser call only when `Origin` is this deployment. On Vercel that list is `https://` plus `VERCEL_URL`, `VERCEL_BRANCH_URL`, and `VERCEL_PROJECT_PRODUCTION_URL` (set by the platform). A custom domain needs `PIXEL_ORIGIN` set to that `https://` origin. If `PIXEL_ORIGIN` is set outside Vercel, it is the allowlist. Otherwise a local host still compares `Origin` to the request `Host`.
 
-The function also keeps a best-effort limit of 10 downloads a minute per address. The map is capped and old addresses are dropped, but it still lives in one process, so it is not shared by every Vercel instance or region. Hobby includes one free [WAF rate-limiting rule](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting) (IP key, fixed window, 1,000,000 included requests). Add it yourself if you want the edge to enforce the same limit. This repo does not create the rule:
+The function also keeps a best-effort limit of 10 downloads a minute per address. IPv6 addresses in the same /64 share one bucket. The map drops addresses only after their window expires, and a full map refuses new addresses instead of forgetting one that is already blocked. It still lives in one process, so it is not shared by every Vercel instance or region. Hobby includes one free [WAF rate-limiting rule](https://vercel.com/docs/vercel-firewall/vercel-waf/rate-limiting) (IP key, fixed window, 1,000,000 included requests). Add it yourself if you want the edge to enforce the same limit. This repo does not create the rule:
 
 1. Open the project, then **Firewall → Configure → + New Rule**.
 2. Name it `Limit fetch`. If the path starts with `/api/fetch`, choose **Rate Limit**.

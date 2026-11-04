@@ -9,6 +9,7 @@ to be published.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import threading
 import time
@@ -34,8 +35,8 @@ class SlidingRateLimit:
             self._sweep(moment)
             hits = self._hits.get(key)
             if hits is None:
-                while self._hits and len(self._hits) >= self.max_keys:
-                    self._evict_oldest()
+                if len(self._hits) >= self.max_keys:
+                    return False
                 hits = deque()
                 self._hits[key] = hits
             cutoff = moment - self.window_seconds
@@ -47,14 +48,15 @@ class SlidingRateLimit:
             return True
 
     def _sweep(self, moment: float) -> None:
+        """Drop addresses whose newest hit is already outside the window.
+
+        Keys still inside the window stay, including ones already at the limit.
+        A full map rejects a new address instead of forgetting a blocked one.
+        """
         cutoff = moment - self.window_seconds
         stale = [key for key, hits in self._hits.items() if not hits or hits[-1] <= cutoff]
         for key in stale:
             del self._hits[key]
-
-    def _evict_oldest(self) -> None:
-        oldest = min(self._hits, key=lambda key: self._hits[key][-1] if self._hits[key] else float("-inf"))
-        del self._hits[oldest]
 
 
 def same_origin(request: Request) -> bool:
@@ -66,7 +68,7 @@ def same_origin(request: Request) -> bool:
     parsed = urlsplit(origin)
     if not _origin_shape_ok(parsed):
         return False
-    if _on_vercel():
+    if _on_vercel() or (os.environ.get("PIXEL_ORIGIN") or "").strip():
         return _canonical(parsed) in _allowed_origins()
     host = (request.headers.get("host") or "").strip().lower()
     return parsed.scheme == request.url.scheme and parsed.netloc.lower() == host
@@ -77,10 +79,28 @@ def client_address(request: Request) -> str:
     if _on_vercel():
         real = (request.headers.get("x-real-ip") or "").strip()
         if real:
-            return real
+            return _rate_key(real)
     if request.client and request.client.host:
-        return request.client.host
+        return _rate_key(request.client.host)
     return "unknown"
+
+
+def _rate_key(address: str) -> str:
+    """IPv4 stays as itself. IPv6 shares one bucket per /64."""
+    raw = address.strip()
+    if raw.startswith("[") and "]" in raw:
+        raw = raw[1:raw.index("]")]
+    raw = raw.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        return address.strip() or "unknown"
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    if isinstance(ip, ipaddress.IPv6Address):
+        network = ipaddress.IPv6Network((ip, 64), strict=False)
+        return f"{network.network_address}/64"
+    return str(ip)
 
 
 def _on_vercel() -> bool:
@@ -89,7 +109,7 @@ def _on_vercel() -> bool:
 
 def _allowed_origins() -> set[str]:
     origins = set()
-    for key in ("VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL"):
+    for key in ("VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL", "VERCEL_BRANCH_URL"):
         origin = _https_host_origin(os.environ.get(key) or "")
         if origin:
             origins.add(origin)
