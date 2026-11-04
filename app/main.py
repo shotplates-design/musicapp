@@ -57,8 +57,13 @@ def create_app(
     @app.post("/api/fetch")
     async def fetch_audio(body: LinkIn, request: Request):
         """Validate a direct file link and stream it back. Nothing is stored."""
+        if not same_origin(request):
+            raise LinkError("Fetch only works from this app.", status=403)
+        if not is_playerprops_url(body.url):
+            raise LinkError("Only playerprops.com links are supported.")
         normalized = canonical_playerprops_url(body.url)
-        
+        if not app.state.limiter.allow(client_address(request)):
+            raise LinkError("Too many downloads from this address. Wait a minute and try again.", status=429)
         tmp = scratch / f"{uuid.uuid4().hex}.bin"
         deadline = time.monotonic() + app.state.fetch_timeout
         try:
