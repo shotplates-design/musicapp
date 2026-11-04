@@ -30,6 +30,7 @@ The server listens on `127.0.0.1` only unless you set `PIXEL_HOST`.
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install "pytest>=8.0"
 pytest
 python -m app
 ```

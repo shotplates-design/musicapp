@@ -202,6 +202,7 @@ def test_vercel_python_runtime_dependencies_are_declared():
     for package in ("fastapi", "httpx", "uvicorn", "mutagen"):
         assert package in requirements
         assert package in project
+    assert "pytest" not in requirements
 
 
 def test_default_cap_fits_under_vercel_hobby_response_limit():

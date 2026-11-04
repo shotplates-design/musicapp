@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pixel-music"
 version = "0.1.0"
@@ -8,6 +12,13 @@ dependencies = [
     "httpx>=0.27",
     "mutagen>=1.47",
 ]
+
+[tool.setuptools]
+packages = ["app", "api"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+app = ["static/**/*"]
 
 [tool.vercel]
 entrypoint = "api.index:app"
