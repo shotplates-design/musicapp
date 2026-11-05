@@ -46,16 +46,31 @@ _STREAM_PROTOCOLS = ("m3u8", "dash", "ism", "f4m")
 
 def is_playerprops_host(host: str) -> bool:
     """True for playerprops.com and its subdomains, not for lookalike names."""
-    return True 
+    name = (host or "").strip().lower().rstrip(".")
+    if not name:
+        return False
+    try:
+        name = name.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return name == PLAYERPROPS_HOST or name.endswith("." + PLAYERPROPS_HOST)
 
 
 def is_playerprops_url(url: str) -> bool:
-    return True
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+        return False
+    return is_playerprops_host(parts.hostname)
 
 
 def canonical_playerprops_url(url: str) -> str:
-    return url
-
+    canonical = prepare_public_url(url)
+    parts = urlsplit(canonical)
+    if parts.port is not None:
+        raise LinkError("Playerprops links can't include a port.")
+    if not is_playerprops_host(parts.hostname or ""):
+        raise LinkError("That link isn't on playerprops.com.")
+    return canonical
 
 
 # Set by the caller so download_audio can pin connections without extra arguments.
@@ -65,14 +80,17 @@ _job = contextvars.ContextVar("pixel_ydl_job", default=None)
 def download_audio(url, output_path):
     """Download one page with yt-dlp. Same shape as the playerprops script."""
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": output_path,
         "noplaylist": True,
         "quiet": False,
+        "progress_hooks": [_capture_download_info],
     }
     # Generic extractor only, so a page cannot hand off to YouTube or Spotify.
+    ydl_opts["allowed_extractors"] = ["generic"]
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            _pin_ydl(ydl)
             ydl.download([url])
         print(f"Successfully downloaded: {url}")
         return True
@@ -81,7 +99,13 @@ def download_audio(url, output_path):
         if isinstance(cause, LinkError):
             raise cause from e
         error_message = str(e)
-        
+        if "DRM protected" in error_message:
+            print(f"Skipping DRM-protected track: {url}")
+            _remember("drm")
+            return False
+        print(f"Download failed: {error_message}")
+        _remember("fail")
+        return False
     except Exception as e:
         if isinstance(e, LinkError):
             raise
@@ -97,6 +121,26 @@ def _remember(kind: str) -> None:
     job = _job.get()
     if job is not None:
         job["error"] = kind
+
+
+def _remember_info(info: dict) -> None:
+    job = _job.get()
+    if job is None or not isinstance(info, dict):
+        return
+    job["info"] = {
+        "artist": info.get("artist"),
+        "creator": info.get("creator"),
+        "uploader": info.get("uploader"),
+        "title": info.get("title"),
+    }
+
+
+def _capture_download_info(status: dict) -> None:
+    if not isinstance(status, dict) or status.get("status") not in {"downloading", "finished"}:
+        return
+    info = status.get("info_dict")
+    if isinstance(info, dict):
+        _remember_info(info)
 
 
 def _pin_ydl(ydl) -> None:
@@ -127,7 +171,10 @@ async def download_playerprops(url, dest, *, resolver, transport, max_bytes, dea
     try:
         outtmpl = str(Path(folder.name) / "%(title)s.%(ext)s")
         ok = await asyncio.to_thread(download_audio, page, outtmpl)
-        
+        if not ok:
+            if job["error"] == "drm":
+                raise LinkError("That track is DRM-protected. Nothing was saved.")
+            raise LinkError("Couldn't read that playerprops page. Nothing was saved.")
         saved = _newest_file(Path(folder.name))
         size = saved.stat().st_size
         if size > max_bytes:
@@ -139,6 +186,7 @@ async def download_playerprops(url, dest, *, resolver, transport, max_bytes, dea
             mime_type="audio/mp4",
             filename=safe_filename(saved.stem, "m4a"),
             extension="m4a",
+            info=dict(job.get("info") or {}),
         )
     finally:
         _job.reset(token)
@@ -182,6 +230,26 @@ def ydl_params(directory: Path) -> dict:
     }
 
 
+def _extract(url: str, resolver, deadline, transport=None, max_bytes: int = DEFAULT_MAX_BYTES) -> dict:
+    yt_dlp = _yt_dlp()
+    with tempfile.TemporaryDirectory(prefix="pixel-ydl-") as tmp:
+        params = ydl_params(Path(tmp))
+        ydl_cls = _checking_ydl(yt_dlp.YoutubeDL, resolver, deadline, transport, max_bytes)
+        try:
+            with ydl_cls(params) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except LinkError:
+            raise
+        except Exception as exc:
+            cause = _linked_error(exc)
+            if isinstance(cause, LinkError):
+                raise cause from exc
+            if "drm" in str(exc).lower():
+                raise LinkError("That track is DRM-protected. Nothing was saved.") from exc
+            raise LinkError("Couldn't read that playerprops page. Nothing was saved.") from exc
+    if not isinstance(info, dict):
+        raise LinkError("Couldn't read that playerprops page. Nothing was saved.")
+    return info
 
 
 def _linked_error(exc: BaseException):
@@ -370,5 +438,25 @@ def make_pinned_handler(*, resolver, deadline, transport=None, logger=None, max_
     )
 
 
+def _reject_drm(info: dict) -> None:
+    if info.get("has_drm"):
+        raise LinkError("That track is DRM-protected. Nothing was saved.")
+    for fmt in info.get("requested_formats") or []:
+        if isinstance(fmt, dict) and fmt.get("has_drm"):
+            raise LinkError("That track is DRM-protected. Nothing was saved.")
+
+
+def _reject_playlist(info: dict) -> None:
+    if info.get("_type") in {"playlist", "multi_video"}:
+        raise LinkError("Paste one playerprops track, not a playlist. Nothing was saved.")
+
+
+def _reject_stream(info: dict) -> None:
+    protocol = str(info.get("protocol") or "").lower()
+    if any(name in protocol for name in _STREAM_PROTOCOLS):
+        raise LinkError("That track is a stream this server can't save without ffmpeg. Nothing was saved.")
+    requested = [fmt for fmt in (info.get("requested_formats") or []) if isinstance(fmt, dict)]
+    if len(requested) > 1:
+        raise LinkError("That track is a stream this server can't save without ffmpeg. Nothing was saved.")
 
 
