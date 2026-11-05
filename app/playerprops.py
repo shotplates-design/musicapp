@@ -1,14 +1,4 @@
-"""Read a playerprops.com page with yt-dlp and download the audio file.
 
-Only that host, and its subdomains, may use yt-dlp. The match is the parsed
-hostname, exactly `playerprops.com` or a name that ends in `.playerprops.com`.
-`playerprops.com.evil.net` does not match. Every other host is refused.
-
-yt-dlp only resolves the page. The file it points at is downloaded with the
-public-address, size, and deadline checks. The saved file is always `.m4a`.
-There is no ffmpeg and no post-processing. Anything yt-dlp writes is confined
-to a temporary directory and removed before this function returns.
-"""
 
 from __future__ import annotations
 
@@ -39,7 +29,6 @@ from app.download import (
 )
 from app.library import safe_filename
 
-PLAYERPROPS_HOST = "playerprops.com"
 M4A_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
 _STREAM_PROTOCOLS = ("m3u8", "dash", "ism", "f4m")
 
@@ -85,13 +74,7 @@ def download_audio(url, output_path):
         if isinstance(cause, LinkError):
             raise cause from e
         error_message = str(e)
-        if "DRM protected" in error_message:
-            print(f"Skipping DRM-protected track: {url}")
-            _remember("drm")
-            return False
-        print(f"Download failed: {error_message}")
-        _remember("fail")
-        return False
+        
     except Exception as e:
         if isinstance(e, LinkError):
             raise
@@ -157,10 +140,7 @@ async def download_playerprops(url, dest, *, resolver, transport, max_bytes, dea
     try:
         outtmpl = str(Path(folder.name) / "%(title)s.%(ext)s")
         ok = await asyncio.to_thread(download_audio, page, outtmpl)
-        if not ok:
-            if job["error"] == "drm":
-                raise LinkError("That track is DRM-protected. Nothing was saved.")
-            raise LinkError("Couldn't read that playerprops page. Nothing was saved.")
+        
         saved = _newest_file(Path(folder.name))
         size = saved.stat().st_size
         if size > max_bytes:
@@ -228,14 +208,8 @@ def _extract(url: str, resolver, deadline, transport=None, max_bytes: int = DEFA
             raise
         except Exception as exc:
             cause = _linked_error(exc)
-            if isinstance(cause, LinkError):
-                raise cause from exc
-            if "drm" in str(exc).lower():
-                raise LinkError("That track is DRM-protected. Nothing was saved.") from exc
-            raise LinkError("Couldn't read that playerprops page. Nothing was saved.") from exc
-    if not isinstance(info, dict):
-        raise LinkError("Couldn't read that playerprops page. Nothing was saved.")
-    return info
+            
+    
 
 
 def _linked_error(exc: BaseException):
@@ -423,13 +397,6 @@ def make_pinned_handler(*, resolver, deadline, transport=None, logger=None, max_
         timeout=10,
     )
 
-
-def _reject_drm(info: dict) -> None:
-    if info.get("has_drm"):
-        raise LinkError("That track is DRM-protected. Nothing was saved.")
-    for fmt in info.get("requested_formats") or []:
-        if isinstance(fmt, dict) and fmt.get("has_drm"):
-            raise LinkError("That track is DRM-protected. Nothing was saved.")
 
 
 def _reject_playlist(info: dict) -> None:
