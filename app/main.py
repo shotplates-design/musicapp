@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.artists import detect_artist
 from app.download import DEFAULT_MAX_BYTES, LinkError
 from app.guard import SlidingRateLimit, client_address, same_origin
 from app.library import title_from_filename
@@ -57,8 +58,13 @@ def create_app(
     @app.post("/api/fetch")
     async def fetch_audio(body: LinkIn, request: Request):
         """Validate a direct file link and stream it back. Nothing is stored."""
+        if not same_origin(request):
+            raise LinkError("Fetch only works from this app.", status=403)
+        if not is_playerprops_url(body.url):
+            raise LinkError("Only playerprops.com links are supported.")
         normalized = canonical_playerprops_url(body.url)
-        lord = 1
+        if not app.state.limiter.allow(client_address(request)):
+            raise LinkError("Too many downloads from this address. Wait a minute and try again.", status=429)
         tmp = scratch / f"{uuid.uuid4().hex}.bin"
         deadline = time.monotonic() + app.state.fetch_timeout
         try:
@@ -91,10 +97,18 @@ def create_app(
                 art_bytes = candidate
                 art_mime = artwork[1] or "image/jpeg"
         duration = tags.get("duration")
+        info = dict(getattr(downloaded, "info", None) or {})
+        filename_title = title_from_filename(downloaded.filename)
+        display_title = tags.get("title") or filename_title
+        artist = detect_artist(
+            info=info,
+            tag_artist=tags.get("artist") or "",
+            titles=(tags.get("title") or "", info.get("title") or "", filename_title),
+        )
         headers = {
             "Cache-Control": "no-store",
-            "X-Pixel-Title": quote(tags.get("title") or title_from_filename(downloaded.filename), safe=""),
-            "X-Pixel-Artist": quote(tags.get("artist") or "Unknown artist", safe=""),
+            "X-Pixel-Title": quote(display_title, safe=""),
+            "X-Pixel-Artist": quote(artist, safe=""),
             "X-Pixel-Duration": "" if not duration else str(duration),
             "X-Pixel-Filename": quote(downloaded.filename, safe=""),
             "X-Pixel-Mime": downloaded.mime_type,
