@@ -1,5 +1,5 @@
 const DB_NAME = "pixel-music";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbPromise;
 
@@ -27,6 +27,7 @@ export function openDb() {
         const db = request.result;
         if (!db.objectStoreNames.contains("tracks")) db.createObjectStore("tracks", { keyPath: "id" });
         if (!db.objectStoreNames.contains("media")) db.createObjectStore("media", { keyPath: "id" });
+        if (!db.objectStoreNames.contains("playlists")) db.createObjectStore("playlists", { keyPath: "id" });
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => {
@@ -59,6 +60,29 @@ export async function saveTrack(meta, audioBlob, artworkBlob) {
   const tx = db.transaction(["tracks", "media"], "readwrite");
   tx.objectStore("tracks").put(meta);
   tx.objectStore("media").put({ id: meta.id, audio: audioBlob, artwork: artworkBlob || null });
+  await transactionDone(tx);
+}
+
+export async function listPlaylists() {
+  const db = await openDb();
+  const tx = db.transaction("playlists", "readonly");
+  const playlists = await requestToPromise(tx.objectStore("playlists").getAll());
+  await transactionDone(tx);
+  return playlists;
+}
+
+export async function replacePlaylists(playlists) {
+  const db = await openDb();
+  const read = db.transaction("playlists", "readonly");
+  const existing = await requestToPromise(read.objectStore("playlists").getAllKeys());
+  await transactionDone(read);
+  const tx = db.transaction("playlists", "readwrite");
+  const store = tx.objectStore("playlists");
+  const keep = new Set(playlists.map((playlist) => playlist.id));
+  for (const key of existing) {
+    if (!keep.has(key)) store.delete(key);
+  }
+  for (const playlist of playlists) store.put(playlist);
   await transactionDone(tx);
 }
 

@@ -74,6 +74,7 @@ class DownloadedAudio:
     mime_type: str
     filename: str
     extension: str
+    info: dict | None = None
 
 
 def prepare_public_url(url: str) -> str:
