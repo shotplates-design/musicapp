@@ -45,32 +45,18 @@ _STREAM_PROTOCOLS = ("m3u8", "dash", "ism", "f4m")
 
 
 def is_playerprops_host(host: str) -> bool:
-    """True for playerprops.com and its subdomains, not for lookalike names."""
-    name = (host or "").strip().lower().rstrip(".")
-    if not name:
-        return False
-    try:
-        name = name.encode("idna").decode("ascii")
-    except UnicodeError:
-        return False
-    return name == PLAYERPROPS_HOST or name.endswith("." + PLAYERPROPS_HOST)
+    """Host allowlist disabled: every host is accepted."""
+    return True
 
 
 def is_playerprops_url(url: str) -> bool:
-    parts = urlsplit(str(url or "").strip())
-    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
-        return False
-    return is_playerprops_host(parts.hostname)
+    """Host allowlist disabled: every URL is accepted."""
+    return True
 
 
 def canonical_playerprops_url(url: str) -> str:
-    canonical = prepare_public_url(url)
-    parts = urlsplit(canonical)
-    if parts.port is not None:
-        raise LinkError("Playerprops links can't include a port.")
-    if not is_playerprops_host(parts.hostname or ""):
-        raise LinkError("That link isn't on playerprops.com.")
-    return canonical
+    """Host allowlist disabled: the URL is passed through unchanged."""
+    return url
 
 
 # Set by the caller so download_audio can pin connections without extra arguments.

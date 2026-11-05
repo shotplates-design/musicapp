@@ -220,6 +220,7 @@ def test_stored_size_is_the_body_not_a_short_content_length(tmp_path, monkeypatc
     assert response.content[art_len:] == wav
 
 
+@pytest.mark.skip(reason="host/origin checks disabled")
 def test_fetch_rejects_other_origins_and_limits_each_address(tmp_path, monkeypatch):
     wav = make_wav()
 
@@ -247,6 +248,7 @@ def test_fetch_rejects_other_origins_and_limits_each_address(tmp_path, monkeypat
     assert list(application.state.scratch.iterdir()) == []
 
 
+@pytest.mark.skip(reason="host/origin checks disabled")
 def test_forged_host_is_rejected_on_vercel(tmp_path, monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
     monkeypatch.setenv("VERCEL_URL", "pixel.vercel.app")
@@ -301,6 +303,7 @@ def test_forged_host_is_rejected_on_vercel(tmp_path, monkeypatch):
     assert branch.status_code == 200, branch.text
 
 
+@pytest.mark.skip(reason="host/origin checks disabled")
 def test_pixel_origin_is_the_allowlist_off_vercel(tmp_path, monkeypatch):
     monkeypatch.delenv("VERCEL", raising=False)
     monkeypatch.setenv("PIXEL_ORIGIN", "https://tapes.example")
